@@ -1,0 +1,185 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-obsidian: #0a0a0c;
+    --bg-panel: rgba(20, 20, 24, 0.65);
+    --bg-panel-solid: #141418;
+    --bg-input: rgba(15, 15, 18, 0.8);
+    --bg-elevated: #1c1c22;
+    --bg-header: rgba(10, 10, 12, 0.85);
+    --text-primary: #f0ece4;
+    --text-secondary: #9a9590;
+    --text-muted: #5c5855;
+    --text-amber: #e8a838;
+    --accent-amber: #e8a838;
+    --accent-amber-glow: rgba(232, 168, 56, 0.35);
+    --accent-gold: #d4a520;
+    --accent-orange: #c4782a;
+    --accent-green: #4a9b6a;
+    --accent-red: #b84040;
+    --border-subtle: rgba(255, 255, 255, 0.06);
+    --border-active: rgba(232, 168, 56, 0.3);
+    --border-divider: rgba(255, 255, 255, 0.04);
+
+    --background: 240 6% 4%;
+    --foreground: 36 20% 92%;
+    --card: 240 7% 8%;
+    --card-foreground: 36 20% 92%;
+    --popover: 240 7% 8%;
+    --popover-foreground: 36 20% 92%;
+    --primary: 38 78% 56%;
+    --primary-foreground: 240 6% 4%;
+    --secondary: 240 5% 12%;
+    --secondary-foreground: 36 20% 92%;
+    --muted: 240 5% 12%;
+    --muted-foreground: 30 5% 58%;
+    --accent: 240 5% 12%;
+    --accent-foreground: 36 20% 92%;
+    --destructive: 0 50% 48%;
+    --destructive-foreground: 36 20% 92%;
+    --border: 0 0% 100% / 0.06;
+    --input: 0 0% 100% / 0.06;
+    --ring: 38 78% 56%;
+    --radius: 0.75rem;
+    --sidebar-background: 240 7% 8%;
+    --sidebar-foreground: 30 5% 58%;
+    --sidebar-primary: 38 78% 56%;
+    --sidebar-primary-foreground: 240 6% 4%;
+    --sidebar-accent: 240 5% 12%;
+    --sidebar-accent-foreground: 36 20% 92%;
+    --sidebar-border: 0 0% 100% / 0.06;
+    --sidebar-ring: 38 78% 56%;
+  }
+
+  body {
+    background-color: var(--bg-obsidian);
+    color: var(--text-primary);
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    @apply border-border;
+  }
+}
+
+@layer components {
+  .glass-card {
+    background: var(--bg-panel);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .glass-card:hover {
+    transform: scale(1.01);
+    border-color: var(--border-active);
+    box-shadow: 0 8px 32px rgba(232, 168, 56, 0.08);
+  }
+
+  .glass-input {
+    background: var(--bg-input);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 12px 16px;
+    color: var(--text-primary);
+    font-size: 16px;
+    transition: all 0.15s ease;
+  }
+
+  .glass-input:focus {
+    outline: none;
+    border-color: var(--accent-amber);
+    box-shadow: 0 0 0 3px rgba(232, 168, 56, 0.15);
+  }
+
+  .glass-input::placeholder {
+    color: var(--text-muted);
+  }
+
+  .btn-primary {
+    background: var(--accent-amber);
+    color: var(--bg-obsidian);
+    border-radius: 12px;
+    padding: 12px 24px;
+    font-weight: 600;
+    font-size: 15px;
+    transition: all 0.15s ease;
+    border: none;
+    cursor: pointer;
+  }
+
+  .btn-primary:hover {
+    background: #f0b850;
+    box-shadow: 0 4px 16px rgba(232, 168, 56, 0.3);
+  }
+
+  .btn-primary:active {
+    transform: scale(0.98);
+  }
+
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    border-radius: 12px;
+    padding: 12px 24px;
+    font-weight: 500;
+    font-size: 15px;
+    transition: all 0.15s ease;
+    cursor: pointer;
+  }
+
+  .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--border-active);
+  }
+
+  .badge {
+    padding: 4px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--bg-elevated);
+  }
+
+  .status-active {
+    color: var(--accent-green);
+  }
+
+  .status-maintenance {
+    color: var(--accent-orange);
+  }
+
+  .status-inactive {
+    color: var(--text-muted);
+  }
+
+  .status-pending {
+    color: var(--accent-amber);
+  }
+
+  .status-overdue {
+    color: var(--accent-red);
+  }
+
+  .status-completed {
+    color: var(--accent-green);
+  }
+
+  .mono-font {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .table-row-hover:hover {
+    background: rgba(255, 255, 255, 0.02);
+  }
+}
