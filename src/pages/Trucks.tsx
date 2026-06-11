@@ -117,7 +117,9 @@ export default function Trucks() {
                     <td className="px-5 py-4"><span className="text-xs px-2 py-1 rounded-md" style={{ background: `${getStatusColor(truck.status)}15`, color: getStatusColor(truck.status) }}>{getStatusLabel(truck.status)}</span></td>
                     <td className="px-5 py-4">
                       <div className="flex items-center justify-end gap-2">
-                        <Link to={`/truck/${truck.id}`} className="p-2 rounded-lg hover:bg-white/10 transition-colors" style={{ color: "var(--accent-amber)" }} title="View Details">
+                        <Link to={`/trucks/${truck.id}`} className="p-2 
+rounded-lg hover:bg-white/10 transition-colors" style={{ color: 
+"var(--accent-amber)" }} title="View Details">
                           <Eye size={16} />
                         </Link>
                         <button onClick={() => openEdit(truck)} className="p-2 rounded-lg" style={{ color: "var(--text-muted)" }} onMouseEnter={(e) => (e.currentTarget.style.color = "var(--accent-amber)")} onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}><Pencil size={16} /></button>
