@@ -1,0 +1,122 @@
+rules_version = '2';
+
+// FleetPulse — regras de segurança do Firestore
+//
+// Antes disto, o papel de "admin" era decidido apenas no navegador
+// (ADMIN_EMAILS no App.tsx). Qualquer motorista logado podia falar direto
+// com a API do Firestore e ler/alterar tudo, ignorando a interface.
+// Aqui a regra roda no servidor do Google e não tem como contornar.
+//
+// Deploy:  firebase deploy --only firestore:rules
+// Teste:   Console do Firebase → Firestore → Rules → Playground
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ───────── helpers ─────────
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function email() {
+      return signedIn() ? request.auth.token.get('email', '') : '';
+    }
+
+    function adminByEmail() {
+      return email().lower() in [
+        'info@dragndrop.us',
+        'rogerquerinosilva@gmail.com'
+      ];
+    }
+
+    // Lê o papel do documento users/{uid}. O custom claim `admin` é checado
+    // primeiro porque é mais barato (não faz leitura extra) — se um dia você
+    // migrar para custom claims, esta linha já está pronta.
+    function adminByDoc() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'admin';
+    }
+
+    function isAdmin() {
+      return signedIn() && (
+        request.auth.token.get('admin', false) == true ||
+        adminByEmail() ||
+        adminByDoc()
+      );
+    }
+
+    function isDriver() {
+      return signedIn() && !isAdmin();
+    }
+
+    // Campos que mudaram numa escrita
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // ───────── usuários ─────────
+    // Cada um lê o próprio cadastro; ninguém promove a si mesmo a admin.
+    match /users/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow create: if isAdmin() ||
+        (signedIn() && request.auth.uid == uid
+          && request.resource.data.get('role', 'driver') == 'driver');
+      allow update: if isAdmin() ||
+        (signedIn() && request.auth.uid == uid && !changed().hasAny(['role']));
+      allow delete: if isAdmin();
+    }
+
+    // ───────── caminhões ─────────
+    // Motorista precisa ver a frota para escolher o caminhão, e precisa
+    // gravar a milhagem ao abastecer — só isso.
+    match /trucks/{truckId} {
+      allow read: if signedIn();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() ||
+        (isDriver() && changed().hasOnly(['currentKm', 'updatedAt']));
+    }
+
+    // ───────── checklists do motorista ─────────
+    // O motorista cria o próprio checklist e só enxerga os dele.
+    // Aprovar, resolver e apagar é do admin.
+    match /driverChecklists/{docId} {
+      // Nota: aqui o campo é acessado direto (resource.data.driverEmail) e não
+      // com .get(). Em consultas de lista o Firestore precisa casar a regra com
+      // o filtro `where("driverEmail", "==", ...)` da query, e ele não consegue
+      // fazer esse casamento através de um .get() com valor padrão.
+      allow read: if isAdmin() ||
+        (isDriver() && resource.data.driverEmail == email());
+      allow create: if isAdmin() ||
+        (isDriver() && request.resource.data.driverEmail == email());
+      allow update, delete: if isAdmin();
+    }
+
+    // ───────── abastecimentos ─────────
+    // O motorista registra; conferir e corrigir é do admin.
+    match /fuelRecords/{docId} {
+      allow read: if isAdmin();
+      allow create: if signedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // ───────── manutenção, peças e histórico ─────────
+    // Nada disso aparece para o motorista no app.
+    match /maintenance/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /parts/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /partsHistory/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ───────── tudo o mais é proibido ─────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

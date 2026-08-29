@@ -33,6 +33,11 @@ dist-ssr
 db/migrations/*.sql
 # TypeScript cache
 *.tsbuildinfo
+# Cópias manuais de arquivos (para isso existe o git)
+*.backup
+*.backup[0-9]
+*.save
+*_backup.*
 # Build outputs
 dist/
 build/

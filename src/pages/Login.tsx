@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate, Link } from "react-router";
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router";
 import { useFirebaseAuth } from "@/hooks/useFirebaseAuth";
 import { Truck, Mail, Lock, Eye, EyeOff } from "lucide-react";
 
@@ -12,10 +12,11 @@ export default function Login() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  if (isAuthenticated) {
-    navigate("/", { replace: true });
-    return null;
-  }
+  useEffect(() => {
+    if (isAuthenticated) {
+      navigate("/", { replace: true });
+    }
+  }, [isAuthenticated, navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -25,7 +26,7 @@ export default function Login() {
       await login(email, password);
       navigate("/", { replace: true });
     } catch (err: any) {
-      setError(err.message || "Invalid email or password");
+      setError("Invalid email or password / Email ou senha inválidos");
     } finally {
       setLoading(false);
     }
@@ -69,10 +70,6 @@ export default function Login() {
               {loading ? "Signing in..." : "Sign In"}
             </button>
           </form>
-
-          <div className="mt-4 text-center">
-            <Link to="/register" className="text-sm" style={{ color: "var(--accent-amber)" }}>Don't have an account? Register</Link>
-          </div>
         </div>
       </div>
     </div>

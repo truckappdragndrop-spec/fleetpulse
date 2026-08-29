@@ -26,6 +26,15 @@
     --border-active: rgba(232, 168, 56, 0.3);
     --border-divider: rgba(255, 255, 255, 0.04);
 
+    /* Aliases usados pelas telas do motorista, Checklists e Inventory.
+       Sem estas linhas, `background: var(--bg-secondary)` era inválido e o
+       navegador simplesmente ignorava a regra (cards e barra de navegação
+       ficavam transparentes). */
+    --bg-primary: var(--bg-obsidian);
+    --bg-secondary: var(--bg-panel-solid);
+    --card-bg: var(--bg-panel-solid);
+    --border-color: var(--border-subtle);
+
     --background: 240 6% 4%;
     --foreground: 36 20% 92%;
     --card: 240 7% 8%;
@@ -183,3 +192,37 @@
     background: rgba(255, 255, 255, 0.02);
   }
 }
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.2);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
