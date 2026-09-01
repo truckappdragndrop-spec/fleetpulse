@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
+import { useNavigate } from 'react-router';
 import { useCollection } from '@/hooks/useCollection';
-import { useFirebaseAuth } from '@/hooks/useFirebaseAuth';
+import { useDialogs } from '@/components/Dialogs';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -9,120 +10,28 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
-import { Plus, Wrench, Search, Filter, Package, Minus, PlusCircle, ArrowUpDown, ArrowUp, ArrowDown, Printer } from 'lucide-react';
-import { toast } from 'sonner';
+import { Plus, Wrench, Search, Filter, Package, Minus, PlusCircle, ArrowUpDown, ArrowUp, ArrowDown, Printer, Hash, Loader2, ClipboardCheck, AlertTriangle } from 'lucide-react';
 import { format, isValid } from 'date-fns';
-
-interface MaintenanceRecord {
-  id: string;
-  truckId: string;
-  truckName: string;
-  type: string;
-  title?: string;
-  description?: string;
-  cost: number;
-  date: any;
-  status: 'pending' | 'in-progress' | 'completed';
-  mechanic?: string;
-  partIds?: string[];
-  woParts?: { id: string; name?: string; qty: number; unitCost?: number }[];
-  partsCost?: number;
-  mileage?: number;
-  notes?: string;
-  priority?: string;
-  provider?: string;
-  createdAt: any;
-  updatedAt: any;
-}
-
-interface Truck {
-  id: string;
-  fleetId?: string;
-  name?: string;
-  unitNumber?: string;
-  plate?: string;
-  vin?: string;
-  brand?: string;
-  model?: string;
-  mileage?: number;
-  currentKm?: number;
-}
-
-interface PartDoc {
-  id: string;
-  name: string;
-  partNumber: string;
-  quantity: number;
-  cost: number;
-  category: string;
-  supplier: string;
-  minQuantity: number;
-  truckId?: string;
-  status: string;
-}
-
-interface SelectedPart {
-  id: string;
-  quantity: number;
-}
-
-type SortField = "date" | "cost" | null;
-type SortDir = "asc" | "desc";
-
-const safeFormatDate = (dateValue: any, formatStr: string = 'yyyy-MM-dd'): string => {
-  try {
-    if (!dateValue) return '-';
-    let date: Date;
-    if (dateValue instanceof Date) {
-      date = dateValue;
-    } else if (typeof dateValue.toDate === 'function') {
-      date = dateValue.toDate();
-    } else if (dateValue.seconds && typeof dateValue.seconds === 'number') {
-      date = new Date(dateValue.seconds * 1000);
-    } else if (typeof dateValue === 'string') {
-      date = new Date(dateValue);
-    } else if (typeof dateValue === 'number') {
-      date = new Date(dateValue);
-    } else {
-      return '-';
-    }
-    if (!isValid(date) || isNaN(date.getTime())) {
-      return '-';
-    }
-    return format(date, formatStr);
-  } catch (e) {
-    return '-';
-  }
-};
-
-const safeToDateInput = (dateValue: any): string => {
-  try {
-    if (!dateValue) return format(new Date(), 'yyyy-MM-dd');
-    let date: Date;
-    if (dateValue instanceof Date) {
-      date = dateValue;
-    } else if (typeof dateValue.toDate === 'function') {
-      date = dateValue.toDate();
-    } else if (dateValue.seconds && typeof dateValue.seconds === 'number') {
-      date = new Date(dateValue.seconds * 1000);
-    } else if (typeof dateValue === 'string') {
-      date = new Date(dateValue);
-    } else {
-      return format(new Date(), 'yyyy-MM-dd');
-    }
-    if (!isValid(date) || isNaN(date.getTime())) {
-      return format(new Date(), 'yyyy-MM-dd');
-    }
-    return format(date, 'yyyy-MM-dd');
-  } catch (e) {
-    return format(new Date(), 'yyyy-MM-dd');
-  }
-};
+import { displayWoNumber, nextWorkOrderNumber, woSearchTerms } from '@/lib/workOrderNumber';
+import { clearWorkOrderLink, resolveChecklistFromWorkOrder } from '@/lib/checklistLink';
+import { consumeParts, findShortages, returnParts, type StockLine, type WorkOrderContext } from '@/lib/stock';
+import { applyOilChangeToTruck } from '@/lib/truckSync';
+import WorkOrderDialog from './maintenance/WorkOrderDialog';
+import type { MaintenanceRecord, PartDoc, SelectedPart, SortDir, SortField, Truck } from './maintenance/types';
+import {
+  MAINTENANCE_TYPES,
+  PRIORITIES,
+  getPriorityColor,
+  safeFormatDate,
+  safeToDateInput,
+} from './maintenance/utils';
 
 const Maintenance = () => {
+  const navigate = useNavigate();
   const { data: maintenanceRecords, isLoading: recordsLoading, create: createRecord, update: updateRecord, remove: removeRecord } = useCollection<MaintenanceRecord>('maintenance');
+  const { confirm, notify } = useDialogs();
   const { data: trucks, isLoading: trucksLoading } = useCollection<Truck>('trucks');
-  const { data: parts, isLoading: partsLoading, update: updatePart } = useCollection<PartDoc>('parts');
+  const { data: parts, isLoading: partsLoading } = useCollection<PartDoc>('parts');
 
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedRecord, setSelectedRecord] = useState<MaintenanceRecord | null>(null);
@@ -131,19 +40,38 @@ const Maintenance = () => {
   const [sortField, setSortField] = useState<SortField>("date");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [woOpen, setWoOpen] = useState(false);
+  const [numbering, setNumbering] = useState(false);
 
-  const handlePrintWo = () => {
-    const content = document.getElementById('work-order-print');
-    if (!content) return;
-    const win = window.open('', '_blank', 'width=850,height=900');
-    if (!win) { alert('Please allow popups to print'); return; }
-    win.document.write('<html><head><title>Work Order</title></head><body style="margin:0;padding:24px;background:#fff;">' + content.innerHTML + '</body></html>');
-    document.querySelectorAll('style, link[rel="stylesheet"]').forEach(function(el) {
-      win.document.head.appendChild(el.cloneNode(true));
+  // Manutenções gravadas antes desta funcionalidade, ainda sem número.
+  const unnumbered = (maintenanceRecords || []).filter(r => !r.woNumber);
+
+  // Percorre o histórico em ordem de data e atribui um número a cada uma,
+  // usando o mesmo contador das ordens novas. Some da tela quando termina.
+  const numberOldRecords = async () => {
+    if (numbering || unnumbered.length === 0) return;
+    const ok = await confirm({
+      title: `Number ${unnumbered.length} older records?`,
+      message: 'Vai atribuir um número de ordem de serviço a cada manutenção antiga, da mais velha para a mais nova. Roda uma vez só.',
+      confirmLabel: 'Number them',
     });
-    win.document.close();
-    win.focus();
-    setTimeout(function() { win.print(); }, 400);
+    if (!ok) return;
+
+    setNumbering(true);
+    try {
+      const inOrder = [...unnumbered].sort((a, b) =>
+        safeToDateInput(a.date).localeCompare(safeToDateInput(b.date))
+      );
+      for (const record of inOrder) {
+        const { number } = await nextWorkOrderNumber();
+        await updateRecord(record.id, { woNumber: number } as Partial<MaintenanceRecord>);
+      }
+      notify(`${inOrder.length} records numbered / numeradas`, 'success');
+    } catch (error) {
+      console.error('Error numbering old records:', error);
+      notify('Could not finish numbering — run it again to continue', 'error');
+    } finally {
+      setNumbering(false);
+    }
   };
 
   const [formData, setFormData] = useState({
@@ -162,21 +90,6 @@ const Maintenance = () => {
     selectedParts: [] as SelectedPart[]
   });
 
-  const maintenanceTypes = [
-    'Oil Change',
-    'Tire Inspection',
-    'Brake Check',
-    'Engine Tune-up',
-    'Filter Replacement',
-    'Electrical',
-    'Suspension',
-    'Transmission',
-    'Cooling System',
-    'Other'
-  ];
-
-  const priorities = ['Low', 'Medium', 'High'];
-
   const selectedPartsCost = useMemo(() => {
     if (!parts || !formData.selectedParts.length) return 0;
     return formData.selectedParts.reduce((total, sp) => {
@@ -189,11 +102,16 @@ const Maintenance = () => {
   const totalCost = laborCost + selectedPartsCost;
 
   const filteredRecords = maintenanceRecords?.filter(record => {
+    const term = searchTerm.trim().toLowerCase();
     const matchesSearch =
-      (record.truckName || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (record.title || record.description || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (record.mechanic || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (record.type || '').toLowerCase().includes(searchTerm.toLowerCase());
+      !term ||
+      // Número da ordem de serviço: aceita "WO-0042", "0042" ou "42"
+      woSearchTerms(record).includes(term) ||
+      (record.truckName || '').toLowerCase().includes(term) ||
+      (record.title || record.description || '').toLowerCase().includes(term) ||
+      (record.mechanic || '').toLowerCase().includes(term) ||
+      (record.provider || '').toLowerCase().includes(term) ||
+      (record.type || '').toLowerCase().includes(term);
 
     const matchesStatus = filterStatus === 'all' || record.status === filterStatus;
 
@@ -229,11 +147,93 @@ const Maintenance = () => {
     return 0;
   });
 
+  /**
+   * Peças abaixo do estoque mínimo que estão em ordens ainda não concluídas.
+   * Serve para comprar antes de o mecânico chegar e não ter a peça.
+   */
+  const lowStockInOpenOrders = (() => {
+    const open = (maintenanceRecords || []).filter(r => r.status !== 'completed');
+    const needed = new Set<string>();
+    open.forEach(r => {
+      const saved = (r as any).woParts || [];
+      if (saved.length > 0) saved.forEach((wp: any) => needed.add(wp.id));
+      else (r.partIds || []).forEach(id => needed.add(id));
+    });
+    return (parts || []).filter(p => {
+      if (!needed.has(p.id)) return false;
+      const min = Number((p as any).minStock ?? p.minQuantity ?? 0);
+      return min > 0 && Number(p.quantity || 0) <= min;
+    });
+  })();
+
+  /** Peças de um registro já gravado, no formato usado pelo estoque. */
+  const linesFromRecord = (record: MaintenanceRecord): StockLine[] => {
+    const saved = (record as any).woParts || [];
+    if (saved.length > 0) {
+      return saved.map((wp: any) => ({
+        partId: wp.id,
+        partName: wp.name || parts?.find(p => p.id === wp.id)?.name || 'Part',
+        quantity: Number(wp.qty) || 1,
+        unitCost: Number(wp.unitCost) || 0,
+      }));
+    }
+    // Registros antigos guardavam só a lista de ids, uma unidade cada.
+    return (record.partIds || []).map(id => {
+      const part = parts?.find(p => p.id === id);
+      return { partId: id, partName: part?.name || 'Part', quantity: 1, unitCost: Number(part?.cost) || 0 };
+    });
+  };
+
+  /** Peças escolhidas agora no formulário. */
+  const linesFromForm = (): StockLine[] =>
+    formData.selectedParts.map(sp => {
+      const part = parts?.find(p => p.id === sp.id);
+      return {
+        partId: sp.id,
+        partName: part?.name || 'Part',
+        quantity: sp.quantity,
+        unitCost: Number(part?.cost) || 0,
+      };
+    });
+
+  const stockContext = (woNumber: string, maintenanceId?: string): WorkOrderContext => ({
+    woNumber,
+    maintenanceId,
+    truckName: trucks?.find(t => t.id === formData.truckId)?.fleetId || formData.truckId,
+    date: formData.date,
+  });
+
+  /**
+   * Avisa se falta saldo e deixa a decisão com quem está gravando.
+   *
+   * `credit` são as peças que a ordem já usava e serão devolvidas antes de
+   * consumir a lista nova — sem isso, editar uma ordem sem mexer nas peças
+   * acusaria falta de estoque, porque o saldo atual já está descontado.
+   */
+  const confirmShortages = async (lines: StockLine[], credit: StockLine[] = []) => {
+    const available = (parts || []).map(p => {
+      const back = credit
+        .filter(c => c.partId === p.id)
+        .reduce((sum, c) => sum + c.quantity, 0);
+      return { ...p, quantity: Number(p.quantity || 0) + back };
+    });
+    const shortages = findShortages(lines, available);
+    if (shortages.length === 0) return true;
+    const detail = shortages
+      .map(sh => `${sh.partName}: precisa ${sh.needed}, tem ${sh.available}`)
+      .join(' • ');
+    return confirm({
+      title: 'Not enough stock / Estoque insuficiente',
+      message: `${detail}. O saldo vai parar em zero e a ordem fica registrada com a quantidade que você pediu. Gravar assim mesmo?`,
+      confirmLabel: 'Save anyway',
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!formData.truckId || !formData.type || !formData.title) {
-      toast.error('Please fill in all required fields');
+      notify('Please fill in all required fields', "error");
       return;
     }
 
@@ -263,65 +263,78 @@ const Maintenance = () => {
       };
 
       if (selectedRecord) {
-        const oldWoParts = (selectedRecord as any).woParts || [];
-        const oldPartIds = oldWoParts.length > 0 ? oldWoParts.flatMap((wp: any) => Array(wp.qty || 1).fill(wp.id)) : (selectedRecord.partIds || []);
-        const newPartIds = formData.selectedParts.map(sp => sp.id);
+        const woNumber = displayWoNumber(selectedRecord);
+        const ctx = stockContext(woNumber, selectedRecord.id);
+        const oldLines = linesFromRecord(selectedRecord);
+        const newLines = linesFromForm();
 
-        for (const partId of oldPartIds) {
-          const part = parts?.find(p => p.id === partId);
-          if (part) {
-            await updatePart(partId, { quantity: part.quantity + 1 });
-          }
-        }
+        if (!(await confirmShortages(newLines, oldLines))) return;
 
-        for (const sp of formData.selectedParts) {
-          const part = parts?.find(p => p.id === sp.id);
-          if (part && part.quantity >= sp.quantity) {
-            await updatePart(sp.id, { quantity: part.quantity - sp.quantity });
-          }
-        }
+        // Devolve o que a ordem usava antes e consome a lista nova. As duas
+        // operações passam pelo histórico, então o Inventory mostra a troca.
+        await returnParts(oldLines, ctx);
+        await consumeParts(newLines, ctx);
 
         await updateRecord(selectedRecord.id, recordData);
-        toast.success('Maintenance record updated successfully');
-      } else {
-        for (const sp of formData.selectedParts) {
-          const part = parts?.find(p => p.id === sp.id);
-          if (part && part.quantity >= sp.quantity) {
-            await updatePart(sp.id, { quantity: part.quantity - sp.quantity });
-          }
+        notify('Maintenance record updated successfully', "success");
+        if (formData.status === 'completed' && selectedRecord.status !== 'completed') {
+          // Usa os dados recém-gravados (tipo e milhagem podem ter mudado).
+          await onRecordCompleted({ ...selectedRecord, ...recordData } as MaintenanceRecord);
         }
+      } else {
+        const newLines = linesFromForm();
+        if (!(await confirmShortages(newLines))) return;
 
-        await createRecord(recordData);
-        toast.success('Maintenance record added successfully');
+        // Toda manutenção nasce com um número de ordem de serviço.
+        const { number: woNumber, provisional } = await nextWorkOrderNumber();
+        const newId = await createRecord({ ...recordData, woNumber } as typeof recordData & { woNumber: string });
+        await consumeParts(newLines, stockContext(woNumber, newId));
+        notify(
+          provisional
+            ? `${woNumber} saved with a temporary number / número provisório`
+            : `${woNumber} created / criada`,
+          provisional ? "warning" : "success"
+        );
       }
 
       resetForm();
       setIsDialogOpen(false);
     } catch (error) {
       console.error('Error saving maintenance record:', error);
-      toast.error('Failed to save maintenance record');
+      notify('Failed to save maintenance record', "error");
     }
   };
 
   const handleDelete = async (record: MaintenanceRecord) => {
-    if (!confirm('Are you sure you want to delete this maintenance record?')) return;
+    const ok = await confirm({
+      title: 'Delete maintenance record?',
+      message: 'Parts used will be returned to stock. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
 
     try {
-      const delWoParts = (record as any).woParts || [];
-      const delPartIds = delWoParts.length > 0 ? delWoParts.flatMap((wp: any) => Array(wp.qty || 1).fill(wp.id)) : (record.partIds || []);
-      if (delPartIds.length > 0) {
-        for (const partId of delPartIds) {
-          const part = parts?.find(p => p.id === partId);
-          if (part) {
-            await updatePart(partId, { quantity: part.quantity + 1 });
-          }
-        }
-      }
+      const woNumber = displayWoNumber(record);
+      await returnParts(linesFromRecord(record), {
+        woNumber,
+        maintenanceId: record.id,
+        truckName: record.truckName || record.truckId,
+        date: safeToDateInput(record.date),
+      });
+
+      // Solta o item do checklist, para que outra ordem possa ser aberta.
+      const released = await clearWorkOrderLink(record);
 
       await removeRecord(record.id);
-      toast.success('Maintenance record deleted successfully');
+      notify(
+        released
+          ? 'Record deleted — checklist item released / item do checklist liberado'
+          : 'Maintenance record deleted successfully',
+        "success"
+      );
     } catch (error) {
-      toast.error('Failed to delete maintenance record');
+      notify('Failed to delete maintenance record', "error");
     }
   };
 
@@ -385,25 +398,51 @@ const Maintenance = () => {
       setIsDialogOpen(true);
     } catch (error) {
       console.error('Error opening edit dialog:', error);
-      toast.error('Failed to open edit dialog');
+      notify('Failed to open edit dialog', "error");
+    }
+  };
+
+  /**
+   * Ao concluir uma ordem que nasceu de um checklist, resolve o item lá também.
+   * Evita ter que ir na tela de Checklists clicar em "Fixed" de novo.
+   */
+  const syncChecklistOnComplete = async (record?: MaintenanceRecord | null) => {
+    if (!record?.checklistId) return;
+    const { updated, checklistClosed } = await resolveChecklistFromWorkOrder(record);
+    if (!updated) return;
+    notify(
+      checklistClosed
+        ? 'Checklist item marked fixed — checklist closed / checklist encerrado'
+        : 'Checklist item marked fixed / item do checklist marcado como resolvido',
+      'success'
+    );
+  };
+
+  /** Tudo que precisa acontecer em outras telas quando uma ordem é concluída. */
+  const onRecordCompleted = async (record?: MaintenanceRecord | null) => {
+    if (!record) return;
+    await syncChecklistOnComplete(record);
+
+    // Troca de óleo concluída zera o contador do caminhão e apaga o alerta.
+    const miles = await applyOilChangeToTruck(record);
+    if (miles) {
+      notify(
+        `Oil change registered at ${miles.toLocaleString()} mi / troca de óleo registrada`,
+        'success'
+      );
     }
   };
 
   const handleStatusChange = async (recordId: string, newStatus: string) => {
     try {
       await updateRecord(recordId, { status: newStatus });
-      toast.success('Status updated successfully');
+      notify('Status updated successfully', "success");
+      if (newStatus === 'completed') {
+        const record = maintenanceRecords?.find(r => r.id === recordId);
+        await onRecordCompleted(record);
+      }
     } catch (error) {
-      toast.error('Failed to update status');
-    }
-  };
-
-  const getPriorityColor = (priority: string) => {
-    switch (priority) {
-      case 'High': return 'text-red-400';
-      case 'Medium': return 'text-primary';
-      case 'Low': return 'text-green-400';
-      default: return 'text-muted-foreground';
+      notify('Failed to update status', "error");
     }
   };
 
@@ -481,14 +520,49 @@ const Maintenance = () => {
               <h1 className="text-3xl font-bold">Maintenance</h1>
               <p className="text-muted-foreground">Schedule and track maintenance</p>
             </div>
-            <Button
-              onClick={() => { resetForm(); setIsDialogOpen(true); }}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground font-semibold"
-            >
-              <Plus className="h-4 w-4 mr-2" />
-              New Maintenance
-            </Button>
+            <div className="flex items-center gap-2">
+              {unnumbered.length > 0 && (
+                <Button
+                  onClick={numberOldRecords}
+                  disabled={numbering}
+                  variant="outline"
+                  className="border-border text-muted-foreground hover:bg-secondary"
+                  title="Assign work order numbers to older records"
+                >
+                  {numbering
+                    ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    : <Hash className="h-4 w-4 mr-2" />}
+                  {numbering ? 'Numbering...' : `Number ${unnumbered.length} older`}
+                </Button>
+              )}
+              <Button
+                onClick={() => { resetForm(); setIsDialogOpen(true); }}
+                className="bg-primary hover:bg-primary/90 text-primary-foreground font-semibold"
+              >
+                <Plus className="h-4 w-4 mr-2" />
+                New Maintenance
+              </Button>
+            </div>
           </div>
+
+          {lowStockInOpenOrders.length > 0 && (
+            <button
+              onClick={() => navigate('/inventory')}
+              className="w-full mb-4 p-3 rounded-xl text-left flex items-start gap-3"
+              style={{ background: 'rgba(232,168,56,0.10)', border: '1px solid rgba(232,168,56,0.30)' }}
+            >
+              <AlertTriangle className="h-5 w-5 flex-shrink-0" style={{ color: 'var(--accent-amber)' }} />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold" style={{ color: 'var(--accent-amber)' }}>
+                  {lowStockInOpenOrders.length} part{lowStockInOpenOrders.length !== 1 ? 's' : ''} running out on open orders
+                  <span className="font-normal" style={{ color: 'var(--text-muted)' }}> / peças acabando em ordens abertas</span>
+                </p>
+                <p className="text-xs mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                  {lowStockInOpenOrders.map(p => `${p.name} (${p.quantity})`).join(' • ')}
+                </p>
+              </div>
+            </button>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
             <Card className="bg-card border-border">
@@ -546,7 +620,7 @@ const Maintenance = () => {
             <div className="flex-1 relative">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input
-                placeholder="Search maintenance..."
+                placeholder="Search WO #, truck, service..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="pl-10 bg-card border-border text-foreground"
@@ -571,6 +645,7 @@ const Maintenance = () => {
               <Table>
                 <TableHeader>
                   <TableRow className="border-border hover:bg-transparent">
+                    <TableHead className="text-muted-foreground whitespace-nowrap">WO #</TableHead>
                     <TableHead className="text-muted-foreground">Truck</TableHead>
                     <TableHead className="text-muted-foreground">Type</TableHead>
                     <TableHead className="text-muted-foreground">Title</TableHead>
@@ -589,13 +664,33 @@ const Maintenance = () => {
                 <TableBody>
                   {sortedRecords.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                      <TableCell colSpan={10} className="text-center text-muted-foreground py-8">
                         No maintenance records found.
                       </TableCell>
                     </TableRow>
                   ) : (
                     sortedRecords.map((record) => (
                       <TableRow key={record.id} className="border-border hover:bg-secondary/60">
+                        <TableCell>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono text-sm whitespace-nowrap" style={{ color: record.woNumber ? 'var(--accent-amber)' : 'var(--text-muted)' }}>
+                              {displayWoNumber(record)}
+                            </span>
+                            {record.checklistId && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  navigate(`/checklists?wo=${encodeURIComponent(displayWoNumber(record))}`);
+                                }}
+                                title="Opened from a driver checklist — click to see the original / Aberta a partir de um checklist"
+                                className="p-0.5 rounded hover:bg-white/10"
+                                style={{ color: 'var(--accent-green)' }}
+                              >
+                                <ClipboardCheck className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        </TableCell>
                         <TableCell>
                           <div className="font-medium text-primary">{record.truckName || 'Unknown'}</div>
                           <div className="text-sm text-muted-foreground">{record.type || '-'}</div>
@@ -710,7 +805,7 @@ const Maintenance = () => {
                     <SelectValue placeholder="Select..." />
                   </SelectTrigger>
                   <SelectContent className="bg-secondary border-border">
-                    {maintenanceTypes.map((type) => (
+                    {MAINTENANCE_TYPES.map((type) => (
                       <SelectItem key={type} value={type} className="text-foreground hover:bg-secondary">{type}</SelectItem>
                     ))}
                   </SelectContent>
@@ -870,7 +965,7 @@ const Maintenance = () => {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent className="bg-secondary border-border">
-                    {priorities.map((p) => (
+                    {PRIORITIES.map((p) => (
                       <SelectItem key={p} value={p} className="text-foreground hover:bg-secondary">{p}</SelectItem>
                     ))}
                   </SelectContent>
@@ -915,126 +1010,13 @@ const Maintenance = () => {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={woOpen} onOpenChange={setWoOpen}>
-        <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto bg-white text-black">
-          
-          <div className="flex items-center justify-between">
-            <DialogHeader>
-              <DialogTitle className="text-black">Work Order</DialogTitle>
-            </DialogHeader>
-            <Button onClick={handlePrintWo} className="bg-amber-500 hover:bg-amber-600 text-black font-semibold">
-              <Printer className="h-4 w-4 mr-2" /> Print / Save PDF
-            </Button>
-          </div>
-
-          {selectedRecord && (() => {
-            const truck = trucks?.find(t => t.id === selectedRecord.truckId);
-            const savedWoParts = (selectedRecord as any).woParts || [];
-            const woParts = savedWoParts.length > 0
-              ? savedWoParts.map((wp: any) => ({ id: wp.id, name: wp.name || 'Part', cost: wp.unitCost || 0, qty: wp.qty || 1 }))
-              : (selectedRecord.partIds || []).map(pid => {
-                  const p = parts?.find(pp => pp.id === pid);
-                  return { id: pid, name: p?.name || 'Part', cost: p?.cost || 0, qty: 1 };
-                });
-            const partsTotal = parseFloat(String(selectedRecord.partsCost || 0));
-            const laborTotal = parseFloat(String(selectedRecord.cost || 0));
-            const woNumber = 'WO-' + selectedRecord.id.slice(-6).toUpperCase();
-            const statusLabel = selectedRecord.status === 'completed' ? 'Completed' : selectedRecord.status === 'in-progress' ? 'In Progress' : 'Pending';
-            return (
-              <div id="work-order-print" className="mt-4 text-black">
-                <div className="flex items-start justify-between pb-4 border-b-2 border-green-600">
-                  <div>
-                    <h1 className="text-2xl font-bold text-green-600">DRAG N' DROP</h1>
-                    <p className="text-sm text-gray-600">Fleet Maintenance</p>
-                  </div>
-                  <div className="text-right">
-                    <h2 className="text-xl font-bold">WORK ORDER</h2>
-                    <p className="text-sm font-mono">{woNumber}</p>
-                    <p className="text-xs text-gray-600">Generated: {format(new Date(), 'MM/dd/yyyy')}</p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4 mt-4">
-                  <div className="border border-gray-300 rounded p-3">
-                    <h3 className="text-xs font-bold text-gray-500 mb-2">VEHICLE</h3>
-                    <p className="font-semibold">{truck ? (truck.fleetId || truck.id) + ' - ' + (truck.brand || '') + ' ' + (truck.model || '') : selectedRecord.truckName}</p>
-                    <div className="text-sm mt-1 space-y-0.5">
-                      <p><span className="text-gray-500">Plate:</span> {truck?.plate || '-'}</p>
-                      <p><span className="text-gray-500">VIN:</span> {truck?.vin || '-'}</p>
-                      <p><span className="text-gray-500">Odometer:</span> {Number(selectedRecord.mileage || truck?.currentKm || truck?.mileage || 0).toLocaleString()} mi</p>
-                    </div>
-                  </div>
-                  <div className="border border-gray-300 rounded p-3">
-                    <h3 className="text-xs font-bold text-gray-500 mb-2">SERVICE</h3>
-                    <div className="text-sm space-y-0.5">
-                      <p><span className="text-gray-500">Date:</span> {safeFormatDate(selectedRecord.date, 'MM/dd/yyyy')}</p>
-                      <p><span className="text-gray-500">Type:</span> {selectedRecord.type || '-'}</p>
-                      <p><span className="text-gray-500">Priority:</span> {selectedRecord.priority || 'Medium'}</p>
-                      <p><span className="text-gray-500">Status:</span> {statusLabel}</p>
-                      <p><span className="text-gray-500">Provider:</span> {selectedRecord.provider || selectedRecord.mechanic || '-'}</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="border border-gray-300 rounded p-3 mt-4">
-                  <h3 className="text-xs font-bold text-gray-500 mb-1">SERVICE DESCRIPTION</h3>
-                  <p className="font-semibold">{selectedRecord.title || selectedRecord.description || '-'}</p>
-                  {selectedRecord.description && selectedRecord.title && (
-                    <p className="whitespace-pre-wrap text-sm text-gray-700 mt-1">{selectedRecord.description}</p>
-                  )}
-                </div>
-
-                {woParts.length > 0 && (
-                  <div className="mt-4">
-                    <h3 className="text-xs font-bold text-gray-500 mb-1">PARTS USED</h3>
-                    <table className="w-full text-sm border border-gray-300">
-                      <thead>
-                        <tr className="bg-gray-100">
-                          <th className="text-left p-2 border-b border-gray-300">Part</th>
-                          <th className="text-center p-2 border-b border-gray-300 w-16">Qty</th>
-                          <th className="text-right p-2 border-b border-gray-300 w-24">Unit</th>
-                          <th className="text-right p-2 border-b border-gray-300 w-24">Total</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {woParts.map(wp => (
-                          <tr key={wp.id}>
-                            <td className="p-2 border-b border-gray-200">{wp.name}</td>
-                            <td className="p-2 border-b border-gray-200 text-center">{wp.qty}</td>
-                            <td className="p-2 border-b border-gray-200 text-right">{'$' + wp.cost.toFixed(2)}</td>
-                            <td className="p-2 border-b border-gray-200 text-right">{'$' + (wp.cost * wp.qty).toFixed(2)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-
-                <div className="mt-4 flex justify-end">
-                  <div className="w-64 border border-gray-300 rounded p-3 text-sm">
-                    <div className="flex justify-between"><span className="text-gray-500">Labor:</span><span>{'$' + laborTotal.toFixed(2)}</span></div>
-                    <div className="flex justify-between"><span className="text-gray-500">Parts:</span><span>{'$' + partsTotal.toFixed(2)}</span></div>
-                    <div className="flex justify-between font-bold text-base border-t border-gray-300 mt-2 pt-2"><span>TOTAL:</span><span className="text-green-700">{'$' + (laborTotal + partsTotal).toFixed(2)}</span></div>
-                  </div>
-                </div>
-
-                {selectedRecord.notes && (
-                  <div className="border border-gray-300 rounded p-3 mt-4">
-                    <h3 className="text-xs font-bold text-gray-500 mb-1">NOTES</h3>
-                    <p className="text-sm">{selectedRecord.notes}</p>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-3 gap-6 mt-10">
-                  <div className="border-t border-gray-400 pt-1 text-xs text-gray-600">Authorized by</div>
-                  <div className="border-t border-gray-400 pt-1 text-xs text-gray-600">Mechanic</div>
-                  <div className="border-t border-gray-400 pt-1 text-xs text-gray-600">Date</div>
-                </div>
-              </div>
-            );
-          })()}
-        </DialogContent>
-      </Dialog>
+      <WorkOrderDialog
+        open={woOpen}
+        onOpenChange={setWoOpen}
+        record={selectedRecord}
+        trucks={trucks}
+        parts={parts}
+      />
     </div>
   );
 };

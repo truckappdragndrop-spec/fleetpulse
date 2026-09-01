@@ -76,6 +76,19 @@
   * {
     @apply border-border;
   }
+
+  /* O Safari do iPhone dá zoom automático em qualquer campo com fonte menor
+     que 16px — o motorista tocava num campo do checklist e a tela inteira
+     pulava. Nas telas pequenas todo campo passa a ter 16px; o `!important` é
+     necessário porque as classes do Tailwind (text-xs, text-sm) têm
+     especificidade maior que um seletor de elemento. */
+  @media (max-width: 767px) {
+    input,
+    select,
+    textarea {
+      font-size: 16px !important;
+    }
+  }
 }
 
 @layer components {

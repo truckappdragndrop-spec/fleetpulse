@@ -3,8 +3,12 @@ import { useCollection } from "@/hooks/useCollection";
 import { Link } from "react-router";
 import {
   Truck, Search, Plus, Pencil, Trash2, X, ChevronLeft, ChevronRight, Eye, Camera,
+  ChevronDown, Check, Wrench,
 } from "lucide-react";
 import type { Timestamp } from "firebase/firestore";
+import { uploadImage, imageSrc } from "@/lib/uploadImage";
+import { useDialogs } from "@/components/Dialogs";
+import { PM_SERVICES, truckRules, type PmRules } from "@/lib/preventive";
 
 interface TruckDoc {
   id: string;
@@ -19,56 +23,29 @@ interface TruckDoc {
   fuelTankCapacity?: number;
   status: "active" | "maintenance" | "inactive" | "sold";
   notes?: string;
+  imageUrl?: string;
+  /** Registros antigos: foto em base64 dentro do próprio documento. */
   imageBase64?: string;
   registrationExpiry?: string;
   insuranceExpiry?: string;
   inspectionExpiry?: string;
   lastOilChangeMiles?: string;
   oilChangeInterval?: string;
+  /** Intervalos de manutenção preventiva deste caminhão. */
+  pmRules?: PmRules;
   createdAt: Timestamp;
-}
-
-function compressImage(file: File, maxWidth: number = 600, maxSizeKB: number = 800): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        let width = img.width;
-        let height = img.height;
-        if (width > maxWidth) {
-          height = (height * maxWidth) / width;
-          width = maxWidth;
-        }
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        ctx?.drawImage(img, 0, 0, width, height);
-        let quality = 0.7;
-        let base64 = canvas.toDataURL("image/jpeg", quality);
-        while (base64.length > maxSizeKB * 1024 && quality > 0.1) {
-          quality -= 0.1;
-          base64 = canvas.toDataURL("image/jpeg", quality);
-        }
-        resolve(base64);
-      };
-      img.onerror = reject;
-      img.src = event.target?.result as string;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
 }
 
 const emptyForm = {
   fleetId: "", plate: "", vin: "", brand: "", model: "", year: new Date().getFullYear(),
-  color: "", currentKm: "0", fuelTankCapacity: 0, status: "active" as const, notes: "", imageBase64: "",
+  color: "", currentKm: "0", fuelTankCapacity: 0, status: "active" as const, notes: "", imageUrl: "",
   registrationExpiry: "", insuranceExpiry: "", inspectionExpiry: "", lastOilChangeMiles: "", oilChangeInterval: "10000",
+  pmRules: {} as PmRules,
 };
 
 export default function Trucks() {
   const { data: trucks, isLoading, create, update, remove } = useCollection<TruckDoc>("trucks");
+  const { confirm, notify } = useDialogs();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
@@ -77,8 +54,21 @@ export default function Trucks() {
   const [page, setPage] = useState(0);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
+  // Só apaga o base64 antigo quando a foto foi de fato trocada nesta edição.
+  const [photoReplaced, setPhotoReplaced] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pageSize = 10;
+  const [pmOpen, setPmOpen] = useState(false);
+
+  // O editor mostra sempre um conjunto completo de regras: o padrão do
+  // catálogo, sobrescrito pelo que este caminhão já tem salvo. Assim ninguém
+  // precisa preencher oito linhas do zero para o alerta começar a funcionar.
+  const rules = truckRules(form);
+  const setRule = (key: string, patch: Partial<PmRules[string]>) =>
+    setForm((prev) => {
+      const base = truckRules(prev);
+      return { ...prev, pmRules: { ...base, [key]: { ...base[key], ...patch } } };
+    });
 
   const filtered = trucks.filter((t) => {
     const matchSearch = !search || t.fleetId.toLowerCase().includes(search.toLowerCase()) || t.plate.toLowerCase().includes(search.toLowerCase()) || t.brand.toLowerCase().includes(search.toLowerCase()) || t.model.toLowerCase().includes(search.toLowerCase()) || (t.vin && t.vin.toLowerCase().includes(search.toLowerCase()));
@@ -93,20 +83,21 @@ export default function Trucks() {
     const file = e.target.files?.[0];
     if (!file) return;
     if (!file.type.startsWith("image/")) {
-      alert("Please select an image file");
+      notify("Please select an image file", "warning");
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
-      alert("Image must be less than 5MB");
+      notify("Image must be less than 5MB", "warning");
       return;
     }
     setUploadingImage(true);
     try {
-      const base64 = await compressImage(file);
-      setImagePreview(base64);
-      setForm(prev => ({ ...prev, imageBase64: base64 }));
+      const url = await uploadImage(file, "trucks");
+      setImagePreview(url);
+      setForm(prev => ({ ...prev, imageUrl: url }));
+      setPhotoReplaced(true);
     } catch (err) {
-      alert("Failed to process image");
+      notify("Failed to upload image", "error");
       console.error(err);
     } finally {
       setUploadingImage(false);
@@ -115,30 +106,54 @@ export default function Trucks() {
 
   function clearImage() {
     setImagePreview(null);
-    setForm(prev => ({ ...prev, imageBase64: "" }));
+    setForm(prev => ({ ...prev, imageUrl: "" }));
+    setPhotoReplaced(true);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.fleetId || !form.plate || !form.brand || !form.model) return;
-    const payload = { ...form, year: Number(form.year), fuelTankCapacity: Number(form.fuelTankCapacity) || 0 };
+    // Grava o conjunto inteiro de regras, e não só o que foi mexido: o padrão
+    // do catálogo pode mudar numa versão futura e não é para isso alterar em
+    // silêncio o intervalo de um caminhão que já estava configurado.
+    const savedRules = truckRules(form);
+    const payload = {
+      ...form,
+      year: Number(form.year),
+      fuelTankCapacity: Number(form.fuelTankCapacity) || 0,
+      pmRules: savedRules,
+      // O card antigo de óleo do Dashboard lê este campo — mantido em sincronia
+      // com a regra, para as duas telas nunca discordarem.
+      oilChangeInterval: String(savedRules.oil?.miles || 0),
+      // Troca de foto: descarta o base64 antigo, que só ocupava espaço no doc.
+      ...(photoReplaced ? { imageBase64: "" } : {}),
+    };
     if (editingId) { await update(editingId, payload); }
     else { await create(payload); }
     setModalOpen(false);
     setEditingId(null);
     setForm(emptyForm);
     setImagePreview(null);
+    setPhotoReplaced(false);
   };
 
-  const handleDelete = async (id: string) => {
-    if (confirm("Are you sure you want to delete this truck?")) await remove(id);
+  const handleDelete = async (truck: TruckDoc) => {
+    const ok = await confirm({
+      title: "Delete truck?",
+      message: `${truck.fleetId} — ${truck.brand} ${truck.model}. This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (ok) await remove(truck.id);
   };
 
   const openEdit = (truck: TruckDoc) => {
     setEditingId(truck.id);
-    setForm({ fleetId: truck.fleetId, plate: truck.plate, vin: truck.vin || "", brand: truck.brand, model: truck.model, year: truck.year, color: truck.color || "", currentKm: truck.currentKm, fuelTankCapacity: truck.fuelTankCapacity || 0, status: truck.status, notes: truck.notes || "", imageBase64: truck.imageBase64 || "", registrationExpiry: truck.registrationExpiry || "", insuranceExpiry: truck.insuranceExpiry || "", inspectionExpiry: truck.inspectionExpiry || "", lastOilChangeMiles: truck.lastOilChangeMiles || "", oilChangeInterval: truck.oilChangeInterval || "10000" });
-    setImagePreview(truck.imageBase64 || null);
+    setForm({ fleetId: truck.fleetId, plate: truck.plate, vin: truck.vin || "", brand: truck.brand, model: truck.model, year: truck.year, color: truck.color || "", currentKm: truck.currentKm, fuelTankCapacity: truck.fuelTankCapacity || 0, status: truck.status, notes: truck.notes || "", imageUrl: truck.imageUrl || "", registrationExpiry: truck.registrationExpiry || "", insuranceExpiry: truck.insuranceExpiry || "", inspectionExpiry: truck.inspectionExpiry || "", lastOilChangeMiles: truck.lastOilChangeMiles || "", oilChangeInterval: truck.oilChangeInterval || "10000", pmRules: truck.pmRules || {} });
+    setImagePreview(imageSrc(truck.imageUrl, truck.imageBase64) || null);
+    setPhotoReplaced(false);
+    setPmOpen(false);
     setModalOpen(true);
   };
 
@@ -149,7 +164,7 @@ export default function Trucks() {
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div><h1 className="text-2xl lg:text-3xl font-semibold" style={{ color: "var(--text-primary)", letterSpacing: "-0.02em" }}>Fleet</h1><p style={{ color: "var(--text-secondary)", fontSize: 15 }}>Manage your trucks</p></div>
-        <button onClick={() => { setEditingId(null); setForm(emptyForm); setImagePreview(null); setModalOpen(true); }} className="btn-primary flex items-center gap-2"><Plus size={18} /> New Truck</button>
+        <button onClick={() => { setEditingId(null); setForm(emptyForm); setImagePreview(null); setPhotoReplaced(false); setModalOpen(true); }} className="btn-primary flex items-center gap-2"><Plus size={18} /> New Truck</button>
       </div>
 
       <div className="flex flex-col sm:flex-row gap-3">
@@ -185,8 +200,8 @@ export default function Trucks() {
                 paginated.map((truck) => (
                   <tr key={truck.id} className="table-row-hover" style={{ borderBottom: "1px solid var(--border-divider)" }}>
                     <td className="px-5 py-4">
-                      {truck.imageBase64 ? (
-                        <img src={truck.imageBase64} alt={truck.fleetId} className="w-12 h-12 rounded-lg object-cover" style={{ border: "1px solid rgba(255,255,255,0.1)" }} />
+                      {imageSrc(truck.imageUrl, truck.imageBase64) ? (
+                        <img src={imageSrc(truck.imageUrl, truck.imageBase64)} alt={truck.fleetId} className="w-12 h-12 rounded-lg object-cover" style={{ border: "1px solid rgba(255,255,255,0.1)" }} />
                       ) : (
                         <div className="w-12 h-12 rounded-lg flex items-center justify-center" style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)" }}>
                           <Truck size={20} style={{ color: "var(--text-muted)" }} />
@@ -206,7 +221,7 @@ export default function Trucks() {
                           <Eye size={16} />
                         </Link>
                         <button onClick={() => openEdit(truck)} className="p-2 rounded-lg" style={{ color: "var(--text-muted)" }} onMouseEnter={(e) => (e.currentTarget.style.color = "var(--accent-amber)")} onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}><Pencil size={16} /></button>
-                        <button onClick={() => handleDelete(truck.id)} className="p-2 rounded-lg" style={{ color: "var(--text-muted)" }} onMouseEnter={(e) => (e.currentTarget.style.color = "var(--accent-red)")} onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}><Trash2 size={16} /></button>
+                        <button onClick={() => handleDelete(truck)} className="p-2 rounded-lg" style={{ color: "var(--text-muted)" }} onMouseEnter={(e) => (e.currentTarget.style.color = "var(--accent-red)")} onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}><Trash2 size={16} /></button>
                       </div>
                     </td>
                   </tr>
@@ -322,10 +337,101 @@ export default function Trucks() {
               {/* Oil Change / Troca de Oleo */}
               <div style={{ borderTop: "1px solid var(--border-divider)", paddingTop: 12 }}>
                 <p className="text-xs font-bold uppercase tracking-wider mb-3" style={{ color: "var(--accent-amber)" }}>Oil Change / Troca de Oleo</p>
-                <div className="grid grid-cols-2 gap-4">
-                  <div><label className="block text-sm mb-1" style={{ color: "var(--text-secondary)" }}>Last Oil Change (miles)</label><input type="number" value={form.lastOilChangeMiles} onChange={(e) => setForm({ ...form, lastOilChangeMiles: e.target.value })} className="glass-input w-full mono-font" placeholder="440000" /></div>
-                  <div><label className="block text-sm mb-1" style={{ color: "var(--text-secondary)" }}>Interval (miles)</label><input type="number" value={form.oilChangeInterval} onChange={(e) => setForm({ ...form, oilChangeInterval: e.target.value })} className="glass-input w-full mono-font" placeholder="10000" /></div>
+                <div>
+                  <label className="block text-sm mb-1" style={{ color: "var(--text-secondary)" }}>Last Oil Change (miles) / Ultima troca</label>
+                  <input type="number" value={form.lastOilChangeMiles} onChange={(e) => setForm({ ...form, lastOilChangeMiles: e.target.value })} className="glass-input w-full mono-font" placeholder="440000" />
+                  <p className="text-[11px] mt-1" style={{ color: "var(--text-muted)" }}>
+                    Only needed once — after that, completing an oil-change work order updates it. / So precisa a primeira vez: depois disso a ordem de servico concluida atualiza sozinha.
+                  </p>
                 </div>
+              </div>
+
+              {/* Preventive Maintenance / Manutencao Preventiva */}
+              <div style={{ borderTop: "1px solid var(--border-divider)", paddingTop: 12 }}>
+                <button
+                  type="button"
+                  onClick={() => setPmOpen(!pmOpen)}
+                  className="w-full flex items-center justify-between gap-2 mb-1"
+                >
+                  <span className="flex items-center gap-2">
+                    <Wrench size={14} style={{ color: "var(--accent-amber)" }} />
+                    <span className="text-xs font-bold uppercase tracking-wider" style={{ color: "var(--accent-amber)" }}>
+                      Preventive Maintenance / Manutencao Preventiva
+                    </span>
+                  </span>
+                  <ChevronDown
+                    size={16}
+                    style={{ color: "var(--text-muted)", transform: pmOpen ? "rotate(180deg)" : "none", transition: "transform .2s" }}
+                  />
+                </button>
+                <p className="text-[11px] mb-3" style={{ color: "var(--text-muted)" }}>
+                  {PM_SERVICES.filter((s) => rules[s.key]?.enabled).length} services tracked — leave a field at 0 to ignore it. / {PM_SERVICES.filter((s) => rules[s.key]?.enabled).length} servicos controlados. Deixe 0 no campo que nao quiser controlar.
+                </p>
+
+                {pmOpen && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 px-2">
+                      <span className="flex-1" />
+                      <span className="text-[10px] uppercase tracking-wider text-right" style={{ color: "var(--text-muted)", width: 96 }}>Every (miles)</span>
+                      <span className="text-[10px] uppercase tracking-wider text-right" style={{ color: "var(--text-muted)", width: 74 }}>Every (months)</span>
+                    </div>
+                    {PM_SERVICES.map((svc) => {
+                      const rule = rules[svc.key];
+                      return (
+                        <div
+                          key={svc.key}
+                          className="flex items-center gap-2 p-2 rounded-lg"
+                          style={{
+                            background: rule.enabled ? "rgba(255,255,255,0.03)" : "transparent",
+                            border: "1px solid var(--border-divider)",
+                            opacity: rule.enabled ? 1 : 0.5,
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setRule(svc.key, { enabled: !rule.enabled })}
+                            className="flex items-center justify-center rounded flex-shrink-0"
+                            style={{
+                              width: 20, height: 20,
+                              background: rule.enabled ? "var(--accent-amber)" : "transparent",
+                              border: "1px solid " + (rule.enabled ? "var(--accent-amber)" : "var(--border-subtle)"),
+                            }}
+                            title={rule.enabled ? "Tracking / Controlando" : "Ignored / Ignorado"}
+                          >
+                            {rule.enabled && <Check size={13} style={{ color: "#1a1a1a" }} />}
+                          </button>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm truncate" style={{ color: "var(--text-primary)" }}>{svc.label}</p>
+                            <p className="text-[11px] truncate" style={{ color: "var(--text-muted)" }}>{svc.labelPt}</p>
+                          </div>
+                          <input
+                            type="number"
+                            min={0}
+                            value={rule.miles || ""}
+                            onChange={(e) => setRule(svc.key, { miles: Number(e.target.value) || 0 })}
+                            disabled={!rule.enabled}
+                            className="glass-input mono-font text-sm text-right"
+                            style={{ width: 96, padding: "6px 8px" }}
+                            placeholder="0"
+                          />
+                          <input
+                            type="number"
+                            min={0}
+                            value={rule.months || ""}
+                            onChange={(e) => setRule(svc.key, { months: Number(e.target.value) || 0 })}
+                            disabled={!rule.enabled}
+                            className="glass-input mono-font text-sm text-right"
+                            style={{ width: 74, padding: "6px 8px" }}
+                            placeholder="0"
+                          />
+                        </div>
+                      );
+                    })}
+                    <p className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                      Whichever comes first counts. The clock resets when a matching work order is completed. / Vale o que vencer primeiro. O relogio zera quando uma ordem de servico do mesmo tipo e concluida.
+                    </p>
+                  </div>
+                )}
               </div>
               <div>
                 <label className="block text-sm mb-1" style={{ color: "var(--text-secondary)" }}>VIN / Chassis</label>

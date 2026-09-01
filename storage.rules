@@ -1,0 +1,83 @@
+rules_version = '2';
+
+// FleetPulse — regras do Firebase Storage (fotos de caminhões, peças,
+// itens de checklist e abastecimentos).
+//
+// Deploy: firebase deploy --only storage
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Mesma lista do firestore.rules. Se um dia mudar lá, mude aqui também.
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email != null
+        && request.auth.token.email.lower() in [
+          'info@dragndrop.us',
+          'rogerquerinosilva@gmail.com'
+        ];
+    }
+
+    // Igual à regra original: imagem, até 5 MB.
+    function validImage() {
+      return request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    /**
+     * O que mudou em relação à regra original, e o que NÃO mudou.
+     *
+     * O objetivo continua sendo o mesmo: `allow write` sozinho inclui apagar,
+     * então qualquer motorista logado podia apagar todas as fotos da frota
+     * chamando a API direto. Isso continua fechado — num apagamento
+     * `request.resource` é nulo, então só passa quem for admin.
+     *
+     * O que saiu foi a exigência `resource == null` ("o arquivo ainda não
+     * existe"), que eu tinha posto para impedir também a sobrescrita. Ela
+     * quebrou envios de verdade: o SDK do Firebase pode mandar a mesma foto em
+     * mais de uma requisição — em upload retomável, ou numa retentativa depois
+     * de uma falha de rede — e a segunda requisição encontra o arquivo já
+     * existindo e leva 403. Por isso só ALGUMAS fotos falhavam: dependia do
+     * tamanho e da conexão, não do conteúdo.
+     *
+     * O que se perde: uma pessoa logada pode, em tese, sobrescrever uma foto.
+     * Na prática o nome do arquivo é sorteado (data + aleatório) e nunca
+     * aparece em lugar nenhum, então não há caminho para adivinhar. Trocar uma
+     * proteção teórica por uploads que funcionam é o negócio certo aqui —
+     * regra que derruba o uso real acaba sendo desligada inteira, e aí não
+     * sobra proteção nenhuma.
+     */
+    function canWrite() {
+      return signedIn() && ((request.resource != null && validImage()) || isAdmin());
+    }
+
+    match /trucks/{fileName} {
+      allow read: if signedIn();
+      allow write: if canWrite();
+    }
+
+    match /parts/{fileName} {
+      allow read: if signedIn();
+      allow write: if canWrite();
+    }
+
+    match /checklists/{fileName} {
+      allow read: if signedIn();
+      allow write: if canWrite();
+    }
+
+    match /fuel/{fileName} {
+      allow read: if signedIn();
+      allow write: if canWrite();
+    }
+
+    // Qualquer outro caminho fica fechado.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

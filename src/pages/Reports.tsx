@@ -3,9 +3,12 @@ import { useCollection } from "@/hooks/useCollection";
 import { useNavigate } from "react-router";
 import { 
   ArrowLeft, Truck, Fuel, Wrench, Gauge, DollarSign, 
-  ChevronRight, FileDown, Loader2
+  ChevronRight, FileDown, Loader2, ArrowUpDown, ArrowUp, ArrowDown, Calendar
 } from "lucide-react";
 import { collection, query, where, getDocs, Timestamp } from "firebase/firestore";
+import { imageSrc } from "@/lib/uploadImage";
+import { displayWoNumber } from "@/lib/workOrderNumber";
+import { useDialogs } from "@/components/Dialogs";
 import { db } from "@/lib/firebase";
 import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
@@ -18,6 +21,7 @@ interface TruckDoc {
   year: number;
   currentKm: string;
   status: string;
+  imageUrl?: string;
   imageBase64?: string;
 }
 
@@ -34,6 +38,9 @@ interface FuelDoc {
 interface MaintDoc {
   id: string;
   truckId: string;
+  /** Número da ordem de serviço. Registros antigos não têm — displayWoNumber
+   *  cai no código derivado do identificador nesse caso. */
+  woNumber?: string;
   type?: string;
   maintenanceType?: string;
   title?: string;
@@ -120,6 +127,7 @@ function parseDate(dateVal: any): Date | null {
 export default function Reports() {
   const navigate = useNavigate();
   const { data: trucks, isLoading: trucksLoading } = useCollection<TruckDoc>("trucks");
+  const { notify } = useDialogs();
   const { data: allFuel } = useCollection<FuelDoc>("fuelRecords");
   const { data: allMaint } = useCollection<MaintDoc>("maintenance");
   const [selectedTruck, setSelectedTruck] = useState<TruckDoc | null>(null);
@@ -129,6 +137,13 @@ export default function Reports() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [pdfData, setPdfData] = useState<YearData[]>([]);
   const [pdfLoading, setPdfLoading] = useState(false);
+
+  // Filtro de período do relatório de um caminhão. Sem ele, as listas de
+  // abastecimento e manutenção mostravam o histórico inteiro de uma vez.
+  const [period, setPeriod] = useState<"all" | "day" | "month" | "year">("all");
+  const [dayValue, setDayValue] = useState("");
+  const [monthValue, setMonthValue] = useState("");
+  const [yearValue, setYearValue] = useState("");
 
   useEffect(() => {
     if (!selectedTruck) {
@@ -285,6 +300,10 @@ export default function Reports() {
 
   const generatePDF = async () => {
     if (!pdfData.length) return;
+    if (!pdfDataForPeriod.length) {
+      notify("No records in the selected period / Nenhum registro no período", "warning");
+      return;
+    }
     setPdfLoading(true);
     try {
       const doc = new jsPDF("landscape", "pt", "a4");
@@ -303,19 +322,28 @@ export default function Reports() {
       doc.setFont("helvetica", "normal");
       doc.text(`Truck: ${truckName}`, 40, 55);
       doc.text(`Generated: ${new Date().toLocaleDateString("en-US")}`, pageWidth - 200, 55);
-      currentY = 80;
+      doc.setFont("helvetica", "bold");
+      doc.text(`Period: ${periodLabel}`, 40, 72);
+      doc.setFont("helvetica", "normal");
+      currentY = 92;
 
-      // ===== SUMMARY - same numbers as screen / mesmos numeros da tela =====
-      const cpmPdf = totalMiles > 0 ? (totalFuelCost + totalMaintCost) / totalMiles : 0;
-      const fuelCpmPdf = totalMiles > 0 ? totalFuelCost / totalMiles : 0;
-      const maintCpmPdf = totalMiles > 0 ? totalMaintCost / totalMiles : 0;
+      // ===== SUMMARY =====
+      // O PDF exporta o mesmo período que está na tela: resumo, tabelas e
+      // nome do arquivo. Assim o papel nunca discorda do que você viu.
+      const pdfFuelCost = totalFuelCost;
+      const pdfMaintCost = totalMaintCost;
+      const pdfMiles = totalMiles;
+
+      const cpmPdf = pdfMiles > 0 ? (pdfFuelCost + pdfMaintCost) / pdfMiles : 0;
+      const fuelCpmPdf = pdfMiles > 0 ? pdfFuelCost / pdfMiles : 0;
+      const maintCpmPdf = pdfMiles > 0 ? pdfMaintCost / pdfMiles : 0;
 
       const boxW = (pageWidth - 90) / 4;
       const statBoxes = [
-        { label: "TOTAL MILES", value: totalMiles.toLocaleString() + " mi" },
-        { label: "FUEL COST", value: "$" + totalFuelCost.toFixed(2) },
-        { label: "MAINT. COST", value: "$" + totalMaintCost.toFixed(2) },
-        { label: "TOTAL COST", value: "$" + (totalFuelCost + totalMaintCost).toFixed(2) },
+        { label: "TOTAL MILES", value: pdfMiles.toLocaleString() + " mi" },
+        { label: "FUEL COST", value: "$" + pdfFuelCost.toFixed(2) },
+        { label: "MAINT. COST", value: "$" + pdfMaintCost.toFixed(2) },
+        { label: "TOTAL COST", value: "$" + (pdfFuelCost + pdfMaintCost).toFixed(2) },
       ];
       statBoxes.forEach((b, i) => {
         const x = 30 + i * (boxW + 10);
@@ -341,17 +369,17 @@ export default function Reports() {
       doc.setFont("helvetica", "bold");
       doc.text("COST PER MILE:", 40, currentY + 19);
       doc.setFontSize(14);
-      doc.text(totalMiles > 0 ? "$" + cpmPdf.toFixed(2) + "/mi" : "-", 140, currentY + 19);
+      doc.text(pdfMiles > 0 ? "$" + cpmPdf.toFixed(2) + "/mi" : "-", 140, currentY + 19);
       doc.setFontSize(9);
       doc.setFont("helvetica", "normal");
-      doc.text("Fuel: " + (totalMiles > 0 ? "$" + fuelCpmPdf.toFixed(2) + "/mi" : "-"), 240, currentY + 19);
-      doc.text("Maint: " + (totalMiles > 0 ? "$" + maintCpmPdf.toFixed(2) + "/mi" : "-"), 330, currentY + 19);
+      doc.text("Fuel: " + (pdfMiles > 0 ? "$" + fuelCpmPdf.toFixed(2) + "/mi" : "-"), 240, currentY + 19);
+      doc.text("Maint: " + (pdfMiles > 0 ? "$" + maintCpmPdf.toFixed(2) + "/mi" : "-"), 330, currentY + 19);
       doc.text("Avg MPG: " + avgMPG.toFixed(1), 440, currentY + 19);
-      doc.text("Refuels: " + truckFuel.length, 540, currentY + 19);
+      doc.text("Refuels: " + visibleFuel.length, 540, currentY + 19);
       doc.text("Oil Changes: " + oilChanges.length, 630, currentY + 19);
       currentY += 42;
 
-      pdfData.forEach((yearData) => {
+      pdfDataForPeriod.forEach((yearData) => {
         if (currentY > pageHeight - 100) {
           doc.addPage();
           currentY = 40;
@@ -459,6 +487,67 @@ export default function Reports() {
         currentY += 15;
       });
 
+      // ===== ORDENS DE SERVIÇO DO PERÍODO =====
+      // As tabelas acima somam por dia; aqui vai o detalhe linha a linha, com
+      // o número da ordem — é por ele que se procura o serviço depois.
+      if (visibleMaint.length > 0) {
+        if (currentY > pageHeight - 140) {
+          doc.addPage();
+          currentY = 40;
+        }
+
+        doc.setFillColor(180, 83, 9);
+        doc.rect(30, currentY, pageWidth - 60, 24, "F");
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(11);
+        doc.setFont("helvetica", "bold");
+        doc.text("  WORK ORDERS / ORDENS DE SERVIÇO", 45, currentY + 16);
+        currentY += 30;
+
+        autoTable(doc, {
+          startY: currentY,
+          margin: { left: 40, right: 40 },
+          head: [["WO #", "Date", "Service", "Status", "Labor ($)", "Parts ($)", "Total ($)"]],
+          body: visibleMaint.map((m) => [
+            displayWoNumber(m),
+            formatAny(m?.date),
+            String(m?.title || m?.type || m?.maintenanceType || "General"),
+            String(m?.status || "pending").toUpperCase(),
+            `$${safeNum(m?.cost).toFixed(2)}`,
+            `$${safeNum(m?.partsCost).toFixed(2)}`,
+            `$${(safeNum(m?.cost) + safeNum(m?.partsCost)).toFixed(2)}`,
+          ]),
+          foot: [[
+            "", "", "", "TOTAL",
+            `$${visibleMaint.reduce((sum, m) => sum + safeNum(m?.cost), 0).toFixed(2)}`,
+            `$${visibleMaint.reduce((sum, m) => sum + safeNum(m?.partsCost), 0).toFixed(2)}`,
+            `$${totalMaintCost.toFixed(2)}`,
+          ]],
+          theme: "plain",
+          headStyles: {
+            fillColor: [217, 119, 6],
+            textColor: [255, 255, 255],
+            fontSize: 9,
+            fontStyle: "bold",
+            cellPadding: 4,
+          },
+          bodyStyles: { fontSize: 9, textColor: [55, 65, 81], cellPadding: 3 },
+          footStyles: { fontSize: 9, fontStyle: "bold", textColor: [55, 65, 81], fillColor: [253, 246, 234] },
+          alternateRowStyles: { fillColor: [249, 250, 251] },
+          columnStyles: {
+            0: { halign: "left", cellWidth: 70, fontStyle: "bold" },
+            1: { halign: "center", cellWidth: 80 },
+            2: { halign: "left" },
+            3: { halign: "center", cellWidth: 80 },
+            4: { halign: "right", cellWidth: 70 },
+            5: { halign: "right", cellWidth: 70 },
+            6: { halign: "right", cellWidth: 75 },
+          },
+          styles: { lineColor: [209, 213, 219], lineWidth: 0.5 },
+        });
+        currentY = (doc as any).lastAutoTable.finalY + 12;
+      }
+
       const totalPages = doc.getNumberOfPages();
       for (let i = 1; i <= totalPages; i++) {
         doc.setPage(i);
@@ -467,37 +556,145 @@ export default function Reports() {
         doc.text(`FleetPulse Report - Page ${i} of ${totalPages}`, pageWidth / 2, pageHeight - 20, { align: "center" });
       }
 
-      doc.save(`FleetPulse_Report_${truckName.replace(/\\s+/g, "_")}_${new Date().toISOString().split("T")[0]}.pdf`);
+      const periodSlug =
+        period === "all" ? "all-time"
+        : period === "day" ? dayValue
+        : period === "month" ? monthValue
+        : yearValue;
+      doc.save(`FleetPulse_Report_${truckName.replace(/\\s+/g, "_")}_${periodSlug}.pdf`);
     } catch (error) {
       console.error("Error generating PDF:", error);
-      alert("Error generating PDF: " + (error as Error).message);
+      notify("Error generating PDF: " + (error as Error).message, "error");
     } finally {
       setPdfLoading(false);
     }
   };
 
+  // ===== FILTRO DE PERÍODO =====
+  // Uma data pode chegar como texto, Timestamp ou Date; parseDate normaliza.
+  const ymdOf = (value: any): string => {
+    const d = parseDate(value);
+    if (!d) return "";
+    return (
+      d.getFullYear() +
+      "-" + String(d.getMonth() + 1).padStart(2, "0") +
+      "-" + String(d.getDate()).padStart(2, "0")
+    );
+  };
+
+  const inPeriod = (value: any): boolean => {
+    if (period === "all") return true;
+    const ymd = ymdOf(value);
+    if (!ymd) return false;
+    if (period === "day") return dayValue ? ymd === dayValue : true;
+    if (period === "month") return monthValue ? ymd.slice(0, 7) === monthValue : true;
+    return yearValue ? ymd.slice(0, 4) === yearValue : true;
+  };
+
+  // Anos que realmente existem nos dados deste caminhão.
+  const availableYears = Array.from(
+    new Set(
+      [
+        ...truckFuel.map(f => ymdOf(f.fuelDate).slice(0, 4)),
+        ...truckMaint.map(m => ymdOf(m.date).slice(0, 4)),
+      ].filter(Boolean)
+    )
+  ).sort().reverse();
+
+  const visibleFuel = truckFuel.filter(f => inPeriod(f.fuelDate));
+  const visibleMaint = truckMaint.filter(m => inPeriod(m.date));
+
+  // Recorta a estrutura ano → mês → dia do PDF para o período escolhido e
+  // recalcula os totais com a mesma regra do original: soma os valores e faz
+  // média só dos períodos que têm consumo registrado.
+  const pdfDataForPeriod: YearData[] = (() => {
+    if (period === "all") return pdfData;
+
+    const source = period === "year" ? yearValue : period === "month" ? monthValue : dayValue;
+    const wantYear = Number(source.slice(0, 4));
+    const wantMonth = period === "all" || period === "year" ? null : Number(source.slice(5, 7));
+    const wantDay = period === "day" ? Number(source.slice(8, 10)) : null;
+    if (!wantYear) return [];
+
+    const sumDays = (days: DayEntry[]) => {
+      const totals = days.reduce(
+        (acc, d) => ({
+          fuel: acc.fuel + d.fuel,
+          maintenance: acc.maintenance + d.maintenance,
+          parts: acc.parts + d.parts,
+          miles: acc.miles + d.miles,
+          avgFuelEff: 0,
+        }),
+        { fuel: 0, maintenance: 0, parts: 0, miles: 0, avgFuelEff: 0 }
+      );
+      const withEff = days.filter(d => d.avgFuelEff > 0);
+      totals.avgFuelEff = withEff.length > 0
+        ? withEff.reduce((sum, d) => sum + d.avgFuelEff, 0) / withEff.length
+        : 0;
+      return totals;
+    };
+
+    return pdfData
+      .filter(yd => yd.year === wantYear)
+      .map(yd => {
+        const months = yd.months
+          .filter(md => wantMonth === null || md.monthIndex + 1 === wantMonth)
+          .map(md => {
+            const days = wantDay === null ? md.days : md.days.filter(d => d.day === wantDay);
+            return { ...md, days, totals: sumDays(days) };
+          })
+          .filter(md => md.days.length > 0);
+
+        const withEff = months.filter(m => m.totals.avgFuelEff > 0);
+        return {
+          ...yd,
+          months,
+          yearTotals: {
+            fuel: months.reduce((sum, m) => sum + m.totals.fuel, 0),
+            maintenance: months.reduce((sum, m) => sum + m.totals.maintenance, 0),
+            parts: months.reduce((sum, m) => sum + m.totals.parts, 0),
+            miles: months.reduce((sum, m) => sum + m.totals.miles, 0),
+            avgFuelEff: withEff.length > 0
+              ? withEff.reduce((sum, m) => sum + m.totals.avgFuelEff, 0) / withEff.length
+              : 0,
+          },
+        };
+      })
+      .filter(yd => yd.months.length > 0);
+  })();
+
+  const periodLabel =
+    period === "all" ? "All time / Todo o período"
+    : period === "day" ? (dayValue ? new Date(dayValue + "T00:00:00").toLocaleDateString("en-US", { dateStyle: "long" }) : "Pick a day")
+    : period === "month" ? (monthValue ? new Date(monthValue + "-01T00:00:00").toLocaleDateString("en-US", { month: "long", year: "numeric" }) : "Pick a month")
+    : (yearValue || "Pick a year");
+
+  // Milhas rodadas no período. Preferimos a soma das milhas de cada
+  // abastecimento; se os registros antigos não tiverem esse campo, cai para a
+  // diferença entre o primeiro e o último odômetro do período.
   const totalMiles = (() => {
     if (!selectedTruck) return 0;
-    const sumDriven = truckFuel.reduce((s, f) => s + safeNum((f as any).kmDriven || (f as any).miles), 0);
+    const sumDriven = visibleFuel.reduce((s, f) => s + safeNum((f as any).kmDriven || (f as any).miles), 0);
     if (sumDriven > 0) return sumDriven;
-    const sorted = [...truckFuel].sort((a, b) => {
+    const sorted = [...visibleFuel].sort((a, b) => {
       const da = a.fuelDate ? new Date(a.fuelDate).getTime() : 0;
       const db = b.fuelDate ? new Date(b.fuelDate).getTime() : 0;
       return da - db;
     });
-    const first = sorted[0];
-    const last = sorted[sorted.length - 1];
-    const firstOdo = first?.kmAtRefuel ? safeNum(first.kmAtRefuel) : safeNum(selectedTruck.currentKm);
-    const lastOdo = last?.kmAtRefuel ? safeNum(last.kmAtRefuel) : safeNum(selectedTruck.currentKm);
+    if (sorted.length < 2) return 0;
+    const firstOdo = safeNum(sorted[0]?.kmAtRefuel);
+    const lastOdo = safeNum(sorted[sorted.length - 1]?.kmAtRefuel);
     return Math.max(0, lastOdo - firstOdo);
   })();
 
-  const totalFuelCost = truckFuel.reduce((s, f) => s + safeNum(f.totalCost), 0);
-  const avgMPG = truckFuel.length > 0 
-    ? truckFuel.reduce((s, f) => s + safeNum(f.efficiency), 0) / truckFuel.length 
+  // Os números do topo acompanham o período escolhido — mostrar "total de
+  // sempre" ao lado de uma lista filtrada faria a tela mentir.
+  const totalFuelCost = visibleFuel.reduce((s, f) => s + safeNum(f.totalCost), 0);
+  const avgMPG = visibleFuel.length > 0 
+    ? visibleFuel.reduce((s, f) => s + safeNum(f.efficiency), 0) / visibleFuel.length 
     : 0;
-  const totalMaintCost = truckMaint.reduce((s, m) => s + safeNum(m.cost) + safeNum(m.partsCost), 0);
-  const oilChanges = truckMaint.filter(m => 
+  const totalMaintCost = visibleMaint.reduce((s, m) => s + safeNum(m.cost) + safeNum(m.partsCost), 0);
+  const oilChanges = visibleMaint.filter(m => 
     (m.type || m.maintenanceType || "").toLowerCase().includes("oil")
   );
 
@@ -513,6 +710,28 @@ export default function Reports() {
   };
 
   const [cpmPeriod, setCpmPeriod] = useState("all");
+  // Ordenação da tabela comparativa. Começa pelo custo total, do maior para o
+  // menor — é a pergunta mais comum: "qual caminhão está me custando mais?"
+  type CpmField = "fleetId" | "fuel" | "maint" | "total" | "miles" | "cpm";
+  const [cpmSort, setCpmSort] = useState<{ field: CpmField; dir: "asc" | "desc" }>({
+    field: "total",
+    dir: "desc",
+  });
+
+  const toggleCpmSort = (field: CpmField) => {
+    setCpmSort(prev =>
+      prev.field === field
+        ? { field, dir: prev.dir === "desc" ? "asc" : "desc" }
+        // Ao trocar de coluna, começa sempre pelo maior (ou por ordem
+        // alfabética, no caso do número de frota).
+        : { field, dir: field === "fleetId" ? "asc" : "desc" }
+    );
+  };
+
+  const cpmSortIcon = (field: CpmField) => {
+    if (cpmSort.field !== field) return <ArrowUpDown size={13} className="opacity-40" />;
+    return cpmSort.dir === "desc" ? <ArrowDown size={13} /> : <ArrowUp size={13} />;
+  };
 
   const cpmMonths = useMemo(() => {
     const set = new Set<string>();
@@ -547,8 +766,27 @@ export default function Reports() {
       const cpm = miles > 0 ? total / miles : 0;
       return { truck: t, fuel: p.fuel, maint: p.maint, miles, total, cpm };
     }).filter(r => r.total > 0 || r.miles > 0)
-      .sort((a, b) => b.cpm - a.cpm);
-  }, [trucks, allFuel, allMaint, cpmPeriod]);
+      .sort((a, b) => {
+        const dir = cpmSort.dir === "desc" ? -1 : 1;
+        if (cpmSort.field === "fleetId") {
+          return (a.truck.fleetId || "").localeCompare(b.truck.fleetId || "", undefined, { numeric: true }) * dir;
+        }
+        return ((a[cpmSort.field] as number) - (b[cpmSort.field] as number)) * dir;
+      });
+  }, [trucks, allFuel, allMaint, cpmPeriod, cpmSort]);
+
+  // Somatório da frota no período selecionado, para o rodapé da tabela.
+  const cpmTotals = useMemo(() => {
+    return costPerMileData.reduce(
+      (acc, r) => ({
+        fuel: acc.fuel + r.fuel,
+        maint: acc.maint + r.maint,
+        total: acc.total + r.total,
+        miles: acc.miles + r.miles,
+      }),
+      { fuel: 0, maint: 0, total: 0, miles: 0 }
+    );
+  }, [costPerMileData]);
 
   if (!selectedTruck) {
     return (
@@ -578,8 +816,8 @@ export default function Reports() {
               >
                 <div className="flex items-start justify-between mb-3">
                   <div className="flex items-center justify-center rounded-xl overflow-hidden" style={{ width: 48, height: 48, background: "rgba(232, 168, 56, 0.1)" }}>
-                    {truck?.imageBase64 ? (
-                      <img src={truck.imageBase64} alt={truck.fleetId} className="w-full h-full object-cover" />
+                    {imageSrc(truck?.imageUrl, truck?.imageBase64) ? (
+                      <img src={imageSrc(truck?.imageUrl, truck?.imageBase64)} alt={truck.fleetId} className="w-full h-full object-cover" />
                     ) : (
                       <Truck size={24} style={{ color: "var(--accent-amber)" }} />
                     )}
@@ -627,12 +865,26 @@ export default function Reports() {
               <table className="w-full">
                 <thead>
                   <tr style={{ borderBottom: "1px solid var(--border-divider)" }}>
-                    <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Truck</th>
-                    <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Fuel</th>
-                    <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Maintenance</th>
-                    <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Total</th>
-                    <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Miles</th>
-                    <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>$/Mile</th>
+                    {([
+                      { field: "fleetId", label: "Truck" },
+                      { field: "fuel", label: "Fuel" },
+                      { field: "maint", label: "Maintenance" },
+                      { field: "total", label: "Total" },
+                      { field: "miles", label: "Miles" },
+                      { field: "cpm", label: "$/Mile" },
+                    ] as { field: CpmField; label: string }[]).map(col => (
+                      <th
+                        key={col.field}
+                        onClick={() => toggleCpmSort(col.field)}
+                        className="text-left px-4 py-3 text-sm font-medium select-none cursor-pointer whitespace-nowrap"
+                        style={{ color: cpmSort.field === col.field ? "var(--accent-amber)" : "var(--text-muted)" }}
+                        title="Click to sort / Clique para ordenar"
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          {col.label} {cpmSortIcon(col.field)}
+                        </span>
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
@@ -653,6 +905,22 @@ export default function Reports() {
                     </tr>
                   ))}
                 </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "1px solid var(--border-subtle)" }}>
+                    <td className="px-4 py-3 text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+                      Fleet total / Total da frota
+                    </td>
+                    <td className="px-4 py-3 mono-font text-sm" style={{ color: "var(--text-secondary)" }}>${cpmTotals.fuel.toFixed(2)}</td>
+                    <td className="px-4 py-3 mono-font text-sm" style={{ color: "var(--text-secondary)" }}>${cpmTotals.maint.toFixed(2)}</td>
+                    <td className="px-4 py-3 mono-font text-sm font-bold" style={{ color: "var(--accent-amber)" }}>${cpmTotals.total.toFixed(2)}</td>
+                    <td className="px-4 py-3 mono-font text-sm" style={{ color: "var(--text-secondary)" }}>
+                      {cpmTotals.miles > 0 ? cpmTotals.miles.toLocaleString() + " mi" : "-"}
+                    </td>
+                    <td className="px-4 py-3 mono-font text-sm" style={{ color: "var(--text-secondary)" }}>
+                      {cpmTotals.miles > 0 ? "$" + (cpmTotals.total / cpmTotals.miles).toFixed(2) + "/mi" : "-"}
+                    </td>
+                  </tr>
+                </tfoot>
               </table>
             </div>
           </div>
@@ -702,8 +970,8 @@ export default function Reports() {
           </button>
           <div className="flex items-center gap-3">
             <div className="flex items-center justify-center rounded-xl overflow-hidden" style={{ width: 56, height: 56, background: "rgba(232, 168, 56, 0.1)" }}>
-              {selectedTruck?.imageBase64 ? (
-                <img src={selectedTruck.imageBase64} alt={selectedTruck.fleetId} className="w-full h-full object-cover" />
+              {imageSrc(selectedTruck?.imageUrl, selectedTruck?.imageBase64) ? (
+                <img src={imageSrc(selectedTruck?.imageUrl, selectedTruck?.imageBase64)} alt={selectedTruck.fleetId} className="w-full h-full object-cover" />
               ) : (
                 <Truck size={28} style={{ color: "var(--accent-amber)" }} />
               )}
@@ -721,13 +989,13 @@ export default function Reports() {
 
         <button
           onClick={generatePDF}
-          disabled={pdfLoading || pdfData.length === 0}
+          disabled={pdfLoading || pdfDataForPeriod.length === 0}
           className="flex items-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all"
           style={{
-            background: pdfLoading || pdfData.length === 0 ? "rgba(74,155,106,0.3)" : "var(--accent-green)",
+            background: pdfLoading || pdfDataForPeriod.length === 0 ? "rgba(74,155,106,0.3)" : "var(--accent-green)",
             color: "#fff",
-            cursor: pdfLoading || pdfData.length === 0 ? "not-allowed" : "pointer",
-            opacity: pdfLoading || pdfData.length === 0 ? 0.6 : 1
+            cursor: pdfLoading || pdfDataForPeriod.length === 0 ? "not-allowed" : "pointer",
+            opacity: pdfLoading || pdfDataForPeriod.length === 0 ? 0.6 : 1
           }}
         >
           {pdfLoading ? (
@@ -736,6 +1004,80 @@ export default function Reports() {
             <><FileDown size={16} /> Export PDF</>
           )}
         </button>
+      </div>
+
+      {/* Período do relatório */}
+      <div className="glass-card p-4 flex flex-wrap items-center gap-2">
+        <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider mr-1" style={{ color: "var(--text-muted)" }}>
+          <Calendar size={14} /> Period / Período
+        </span>
+
+        {([
+          { key: "all", label: "All / Tudo" },
+          { key: "day", label: "Day / Dia" },
+          { key: "month", label: "Month / Mês" },
+          { key: "year", label: "Year / Ano" },
+        ] as { key: typeof period; label: string }[]).map(opt => (
+          <button
+            key={opt.key}
+            onClick={() => {
+              setPeriod(opt.key);
+              // Já entra com um valor razoável, para a lista não vir vazia.
+              const now = new Date();
+              const today =
+                now.getFullYear() +
+                "-" + String(now.getMonth() + 1).padStart(2, "0") +
+                "-" + String(now.getDate()).padStart(2, "0");
+              if (opt.key === "day" && !dayValue) setDayValue(today);
+              if (opt.key === "month" && !monthValue) setMonthValue(today.slice(0, 7));
+              if (opt.key === "year" && !yearValue) setYearValue(availableYears[0] || today.slice(0, 4));
+            }}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium"
+            style={{
+              background: period === opt.key ? "var(--accent-amber)" : "var(--bg-secondary)",
+              color: period === opt.key ? "#1a1a1a" : "var(--text-secondary)",
+              border: "1px solid var(--border-divider)",
+            }}
+          >
+            {opt.label}
+          </button>
+        ))}
+
+        {period === "day" && (
+          <input
+            type="date"
+            value={dayValue}
+            onChange={(e) => setDayValue(e.target.value)}
+            className="px-3 py-1.5 rounded-lg text-sm"
+            style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-primary)", colorScheme: "dark" }}
+          />
+        )}
+        {period === "month" && (
+          <input
+            type="month"
+            value={monthValue}
+            onChange={(e) => setMonthValue(e.target.value)}
+            className="px-3 py-1.5 rounded-lg text-sm"
+            style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-primary)", colorScheme: "dark" }}
+          />
+        )}
+        {period === "year" && (
+          <select
+            value={yearValue}
+            onChange={(e) => setYearValue(e.target.value)}
+            className="px-3 py-1.5 rounded-lg text-sm"
+            style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-primary)" }}
+          >
+            {availableYears.length === 0 && <option value={yearValue}>{yearValue}</option>}
+            {availableYears.map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        )}
+
+        <span className="ml-auto text-xs" style={{ color: "var(--text-muted)" }}>
+          Showing <span style={{ color: "var(--accent-amber)" }}>{periodLabel}</span>
+          {" • "}{visibleFuel.length} refuel{visibleFuel.length !== 1 ? "s" : ""}
+          {" • "}{visibleMaint.length} maintenance
+        </span>
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -783,11 +1125,11 @@ export default function Reports() {
           <p className="text-xs" style={{ color: "var(--text-muted)" }}>Avg MPG</p>
         </div>
         <div className="glass-card p-4 text-center">
-          <p className="text-2xl font-bold mono-font" style={{ color: "var(--accent-amber)" }}>{truckFuel.length}</p>
+          <p className="text-2xl font-bold mono-font" style={{ color: "var(--accent-amber)" }}>{visibleFuel.length}</p>
           <p className="text-xs" style={{ color: "var(--text-muted)" }}>Refuels</p>
         </div>
         <div className="glass-card p-4 text-center">
-          <p className="text-2xl font-bold mono-font" style={{ color: "var(--accent-orange)" }}>{truckMaint.length}</p>
+          <p className="text-2xl font-bold mono-font" style={{ color: "var(--accent-orange)" }}>{visibleMaint.length}</p>
           <p className="text-xs" style={{ color: "var(--text-muted)" }}>Maintenance</p>
         </div>
         <div className="glass-card p-4 text-center">
@@ -832,7 +1174,7 @@ export default function Reports() {
         <div className="p-5 flex items-center gap-2 mb-2">
           <Fuel size={18} style={{ color: "var(--accent-green)" }} />
           <h2 className="text-lg font-semibold" style={{ color: "var(--text-primary)" }}>Fuel Records</h2>
-          <span className="ml-auto text-xs px-2 py-1 rounded-md bg-green-900/30 text-green-400">{truckFuel.length} records</span>
+          <span className="ml-auto text-xs px-2 py-1 rounded-md bg-green-900/30 text-green-400">{visibleFuel.length} records</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -846,7 +1188,7 @@ export default function Reports() {
               </tr>
             </thead>
             <tbody>
-              {truckFuel.length > 0 ? truckFuel.map((f, i) => (
+              {visibleFuel.length > 0 ? visibleFuel.map((f, i) => (
                 <tr key={f?.id || i} className="table-row-hover" style={{ borderBottom: "1px solid var(--border-divider)" }}>
                   <td className="px-4 py-3 text-sm" style={{ color: "var(--text-primary)" }}>{f?.fuelDate || "-"}</td>
                   <td className="px-4 py-3 mono-font text-sm" style={{ color: "var(--text-secondary)" }}>{safeNum(f?.liters).toFixed(1)} gal</td>
@@ -866,12 +1208,13 @@ export default function Reports() {
         <div className="p-5 flex items-center gap-2 mb-2">
           <Wrench size={18} style={{ color: "var(--accent-orange)" }} />
           <h2 className="text-lg font-semibold" style={{ color: "var(--text-primary)" }}>Maintenance Records</h2>
-          <span className="ml-auto text-xs px-2 py-1 rounded-md bg-amber-900/30 text-amber-400">{truckMaint.length} records</span>
+          <span className="ml-auto text-xs px-2 py-1 rounded-md bg-amber-900/30 text-amber-400">{visibleMaint.length} records</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr style={{ borderBottom: "1px solid var(--border-divider)" }}>
+                <th className="text-left px-4 py-3 text-sm font-medium whitespace-nowrap" style={{ color: "var(--text-muted)" }}>WO #</th>
                 <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Date</th>
                 <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Type</th>
                 <th className="text-left px-4 py-3 text-sm font-medium" style={{ color: "var(--text-muted)" }}>Status</th>
@@ -881,8 +1224,11 @@ export default function Reports() {
               </tr>
             </thead>
             <tbody>
-              {truckMaint.length > 0 ? truckMaint.map((m, i) => (
+              {visibleMaint.length > 0 ? visibleMaint.map((m, i) => (
                 <tr key={m?.id || i} className="table-row-hover" style={{ borderBottom: "1px solid var(--border-divider)" }}>
+                  <td className="px-4 py-3 mono-font text-sm whitespace-nowrap" style={{ color: m?.woNumber ? "var(--accent-amber)" : "var(--text-muted)" }}>
+                    {displayWoNumber(m)}
+                  </td>
                   <td className="px-4 py-3 text-sm" style={{ color: "var(--text-primary)" }}>{formatAny(m?.date)}</td>
                   <td className="px-4 py-3 text-sm" style={{ color: "var(--text-secondary)" }}>{m?.title || m?.type || m?.maintenanceType || "General"}</td>
                   <td className="px-4 py-3">
@@ -898,7 +1244,7 @@ export default function Reports() {
                   <td className="px-4 py-3 mono-font text-sm font-medium" style={{ color: "var(--accent-amber)" }}>${(safeNum(m?.cost) + safeNum(m?.partsCost)).toFixed(2)}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={6} className="text-center py-8" style={{ color: "var(--text-muted)" }}>No maintenance records</td></tr>
+                <tr><td colSpan={7} className="text-center py-8" style={{ color: "var(--text-muted)" }}>No maintenance records</td></tr>
               )}
             </tbody>
           </table>

@@ -2,9 +2,39 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { auth, db } from "@/lib/firebase";
 import { useDriverName } from "@/hooks/useDriverName";
+import { uploadImage } from "@/lib/uploadImage";
+import { checkOdometer } from "@/lib/truckSync";
+import { useDialogs } from "@/components/Dialogs";
 import { signOut } from "firebase/auth";
 import { collection, addDoc, getDocs, doc, updateDoc, serverTimestamp } from "firebase/firestore";
-import { LogOut, Truck, Fuel, CheckCircle2, Camera, X } from "lucide-react";
+import { LogOut, Truck, Fuel, CheckCircle2, Camera, X, ImagePlus } from "lucide-react";
+
+/**
+ * Quantas fotos cabem num abastecimento.
+ *
+ * Um abastecimento rende, na prática, três coisas fotografáveis: o cupom, o
+ * painel da bomba e o odômetro. Cinco dá folga para o cupom que sai em duas
+ * partes, sem virar álbum — cada foto é um upload que o motorista espera
+ * terminar em pé no posto, e é espaço pago no Storage.
+ */
+const MAX_PHOTOS = 5;
+
+/** Traduz o código do Firebase Storage para uma frase que diz o que fazer. */
+function photoErrorHint(code: string): string {
+  switch (code) {
+    case "storage/unauthorized":
+      return "permissão negada pelo Storage. As regras precisam ser publicadas (firebase deploy --only storage). / permission denied.";
+    case "storage/unauthenticated":
+      return "sessão expirada. Saia e entre de novo. / session expired, sign in again.";
+    case "storage/quota-exceeded":
+      return "o espaço do Storage acabou. Avise o administrador. / storage quota exceeded.";
+    case "storage/retry-limit-exceeded":
+    case "storage/canceled":
+      return "a internet caiu no meio do envio. Tente de novo. / connection lost, try again.";
+    default:
+      return `erro ${code}. Tente de novo. / try again.`;
+  }
+}
 
 interface TruckOption {
   id: string;
@@ -26,7 +56,12 @@ export default function DriverFuel() {
   const [totalCost, setTotalCost] = useState("");
   const [station, setStation] = useState("");
   const [notes, setNotes] = useState("");
-  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
+  const [photoUrls, setPhotoUrls] = useState<string[]>([]);
+  // Quantas já subiram de quantas foram escolhidas — no 4G do posto, uma barra
+  // parada sem número faz o motorista achar que travou e sair da tela.
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
+  const uploadingPhoto = uploadProgress !== null;
+  const { confirm } = useDialogs();
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState("");
@@ -63,6 +98,29 @@ export default function DriverFuel() {
 
   const selectedTruck = trucks.find(t => t.id === truckId);
 
+  /**
+   * Prévia do abastecimento enquanto o motorista digita.
+   *
+   * Estes números já eram calculados no envio e gravados no banco — mas
+   * ficavam invisíveis para quem estava preenchendo. Mostrando na hora, o
+   * erro de digitação aparece sozinho: consumo de 60 MPG ou de 0,8 MPG num
+   * caminhão não existe, e quem digitou percebe antes de enviar.
+   */
+  const preview = (() => {
+    const previous = Number(selectedTruck?.currentKm) || 0;
+    const entered = Number(odometer) || 0;
+    const gal = Number(gallons) || 0;
+
+    const miles = previous > 0 && entered > previous ? entered - previous : 0;
+    const mpg = miles > 0 && gal > 0 ? miles / gal : 0;
+
+    // Caminhão pesado costuma ficar entre 4 e 12 MPG. Fora disso, algo está
+    // errado — quase sempre um dígito a mais ou a menos.
+    const mpgLooksWrong = mpg > 0 && (mpg < 2 || mpg > 20);
+
+    return { previous, miles, mpg, mpgLooksWrong };
+  })();
+
   // Calcula o total automaticamente (galões x preço)
   useEffect(() => {
     const gal = Number(gallons) || 0;
@@ -72,30 +130,86 @@ export default function DriverFuel() {
     }
   }, [gallons, pricePerGal]);
 
-  const handlePhoto = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        const maxSize = 900;
-        const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
-        canvas.width = img.width * scale;
-        canvas.height = img.height * scale;
-        const ctx = canvas.getContext("2d");
-        ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
-        setPhotoUrl(dataUrl);
-      };
-      img.src = String(reader.result);
-    };
-    reader.readAsDataURL(file);
+  /**
+   * As fotos sobem para o Storage e o registro guarda só as URLs.
+   *
+   * Sobem uma de cada vez, e não todas de uma vez: no sinal fraco de posto,
+   * disparar cinco uploads em paralelo costuma derrubar todos. E uma que falha
+   * não leva junto as que já subiram — elas ficam na tela, e o motorista só
+   * repete a que faltou.
+   */
+  const handlePhotos = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
     e.target.value = "";
+    if (files.length === 0) return;
+
+    const room = MAX_PHOTOS - photoUrls.length;
+    if (room <= 0) {
+      setError(`Maximum ${MAX_PHOTOS} photos / Máximo de ${MAX_PHOTOS} fotos por abastecimento.`);
+      return;
+    }
+
+    const chosen = files.slice(0, room);
+    const ignored = files.length - chosen.length;
+
+    setError("");
+
+    /**
+     * Renova o token de login antes de subir.
+     *
+     * O Storage devolvia 401 "usuário não autenticado" enquanto o resto do app
+     * funcionava — o que parece contradição, mas não é: o Firestore mantém uma
+     * conexão aberta com o token que já pegou, e o Storage faz uma chamada nova
+     * a cada foto. Quando o token vence e a renovação falha, só o Storage
+     * percebe. Forçar a renovação aqui conserta esse caso e, quando não
+     * conserta, diz em voz alta o motivo em vez de deixar a foto sumir.
+     */
+    if (!auth.currentUser) {
+      setError("You are signed out / Você está deslogado. Saia e entre de novo.");
+      return;
+    }
+    try {
+      await auth.currentUser.getIdToken(true);
+    } catch (err: any) {
+      console.error("Token refresh failed:", err?.code, err);
+      setError(
+        `Could not refresh your session / Não foi possível renovar a sessão (${err?.code || "sem código"}). ` +
+        `Isso costuma ser restrição da chave de API no Google Cloud.`
+      );
+      return;
+    }
+
+    setUploadProgress({ done: 0, total: chosen.length });
+
+    const uploaded: string[] = [];
+    let failed = 0;
+    let lastCode = "";
+    for (const file of chosen) {
+      try {
+        uploaded.push(await uploadImage(file, "fuel", { maxWidth: 1100, quality: 0.72 }));
+      } catch (err: any) {
+        // O código do Firebase diz exatamente o que houve. Sem ele, "não
+        // subiu" faz o motorista tentar de novo dez vezes um problema que
+        // está na regra de segurança, e não na internet dele.
+        console.error("Error uploading photo:", err?.code, err);
+        failed++;
+        lastCode = err?.code || err?.message || "unknown";
+      }
+      setUploadProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+    }
+
+    if (uploaded.length > 0) setPhotoUrls((prev) => [...prev, ...uploaded]);
+    setUploadProgress(null);
+
+    if (failed > 0) {
+      setError(`${failed} photo(s) did not upload / ${failed} foto(s) não subiram: ${photoErrorHint(lastCode)}`);
+    } else if (ignored > 0) {
+      setError(`Only ${MAX_PHOTOS} photos per refuel — ${ignored} left out / Máximo de ${MAX_PHOTOS} fotos: ${ignored} ficaram de fora.`);
+    }
   };
 
-  const removePhoto = () => setPhotoUrl(null);
+  const removePhoto = (index: number) =>
+    setPhotoUrls((prev) => prev.filter((_, i) => i !== index));
 
   const resetForm = () => {
     setTruckId("");
@@ -106,7 +220,8 @@ export default function DriverFuel() {
     setTotalCost("");
     setStation("");
     setNotes("");
-    setPhotoUrl(null);
+    setPhotoUrls([]);
+    setUploadProgress(null);
     setSubmitted(false);
   };
 
@@ -117,13 +232,27 @@ export default function DriverFuel() {
     }
   }, [submitted, navigate]);
 
-  const canSubmit = truckId && gallons && odometer && !submitting;
+  // Não deixa salvar enquanto a foto ainda está subindo.
+  const canSubmit = truckId && gallons && odometer && !submitting && !uploadingPhoto;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
     setSubmitting(true);
     setError("");
     try {
+      // Confere a milhagem antes de gravar: um dígito a menos faz a milhagem
+      // do caminhão andar para trás e estraga MPG e alerta de troca de óleo.
+      const odo = checkOdometer(Number(odometer) || 0, selectedTruck?.currentKm);
+      if (!odo.ok) {
+        const proceed = await confirm({
+          title: "Check the odometer / Confira o odômetro",
+          message: `O caminhão está com ${odo.current.toLocaleString()} mi e você digitou ${Number(odometer).toLocaleString()} mi. Está certo?`,
+          confirmLabel: "Yes, it's right / Está certo",
+          cancelLabel: "Let me fix / Vou corrigir",
+        });
+        if (!proceed) { setSubmitting(false); return; }
+      }
+
       const gal = Number(gallons);
       const price = Number(pricePerGal) || 0;
       const finalTotalCost = price > 0 ? (gal * price).toFixed(2) : totalCost;
@@ -140,6 +269,10 @@ export default function DriverFuel() {
         truckBrand: selectedTruck?.brand || "",
         truckModel: selectedTruck?.model || "",
         driverName,
+        // O nome vem do cadastro e pode ser trocado; o e-mail vem do login e
+        // não pode. É por ele que a regra do Firestore confere que o
+        // abastecimento foi mesmo gravado por quem diz ter gravado.
+        driverEmail: auth.currentUser?.email || "",
         fuelDate,
         liters: String(gallons),
         pricePerLiter: pricePerGal || "",
@@ -150,7 +283,11 @@ export default function DriverFuel() {
         efficiency: mpg,
         stationName: station,
         notes,
-        photoUrl: photoUrl || null,
+        photoUrls,
+        // A página Fuel do admin e os relatórios antigos leem `photoUrl`.
+        // Gravar a primeira foto aqui também mantém tudo funcionando sem
+        // precisar migrar os registros que já existem.
+        photoUrl: photoUrls[0] || null,
         createdAt: serverTimestamp(),
       });
 
@@ -264,10 +401,23 @@ export default function DriverFuel() {
                 type="number"
                 value={odometer}
                 onChange={(e) => setOdometer(e.target.value)}
-                placeholder="e.g. 45230"
+                placeholder={preview.previous > 0 ? `> ${preview.previous.toLocaleString()}` : "e.g. 45230"}
                 className="w-full px-3 py-2 rounded-lg text-sm"
                 style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-primary)" }}
               />
+              {preview.previous > 0 && (
+                <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+                  Last reading / Última leitura:{" "}
+                  <span className="mono-font" style={{ color: "var(--text-secondary)" }}>
+                    {preview.previous.toLocaleString()} mi
+                  </span>
+                  {preview.miles > 0 && (
+                    <span style={{ color: "var(--accent-green)" }}>
+                      {" "}• +{preview.miles.toLocaleString()} mi
+                    </span>
+                  )}
+                </p>
+              )}
             </div>
           </div>
 
@@ -324,6 +474,35 @@ export default function DriverFuel() {
             </div>
           </div>
 
+          {/* Resumo do que foi digitado — o motorista confere antes de enviar */}
+          {preview.mpg > 0 && (
+            <div
+              className="p-3 rounded-xl flex items-center justify-between gap-3"
+              style={{
+                background: preview.mpgLooksWrong ? "rgba(239,68,68,0.08)" : "rgba(74,155,106,0.08)",
+                border: `1px solid ${preview.mpgLooksWrong ? "rgba(239,68,68,0.35)" : "rgba(74,155,106,0.3)"}`,
+              }}
+            >
+              <div>
+                <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                  This tank / Neste tanque
+                </p>
+                <p className="text-lg font-bold mono-font" style={{ color: preview.mpgLooksWrong ? "#ef4444" : "var(--accent-green)" }}>
+                  {preview.mpg.toFixed(1)} MPG
+                </p>
+              </div>
+              <p className="text-xs text-right flex-1" style={{ color: "var(--text-muted)" }}>
+                {preview.miles.toLocaleString()} mi ÷ {Number(gallons).toFixed(1)} gal
+                {preview.mpgLooksWrong && (
+                  <span className="block mt-1 font-semibold" style={{ color: "#ef4444" }}>
+                    Check the numbers — this is out of range.
+                    <span className="block font-normal">Confira os números, isso está fora do normal.</span>
+                  </span>
+                )}
+              </p>
+            </div>
+          )}
+
           <div>
             <label className="text-xs block mb-1" style={{ color: "var(--text-muted)" }}>Notes / Observações</label>
             <textarea
@@ -338,40 +517,93 @@ export default function DriverFuel() {
 
           {/* Photo Upload */}
           <div>
-            <label className="text-xs block mb-2" style={{ color: "var(--text-muted)" }}>Photo / Foto do abastecimento</label>
-            <div className="flex items-center gap-3">
-              <label
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer"
-                style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-muted)" }}
-              >
-                <Camera size={14} />
-                {photoUrl ? "Retake / Trocar foto" : "Add photo / Adicionar foto"}
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  className="hidden"
-                  onChange={handlePhoto}
-                />
-              </label>
-              {photoUrl && (
-                <div className="relative">
-                  <img
-                    src={photoUrl}
-                    alt="Fuel receipt"
-                    className="w-14 h-14 rounded object-cover"
-                    style={{ border: "1px solid var(--border-divider)" }}
+            <label className="text-xs block mb-2" style={{ color: "var(--text-muted)" }}>
+              Photos / Fotos do abastecimento{" "}
+              <span className="mono-font" style={{ color: photoUrls.length >= MAX_PHOTOS ? "var(--accent-amber)" : "var(--text-muted)" }}>
+                ({photoUrls.length}/{MAX_PHOTOS})
+              </span>
+            </label>
+
+            {photoUrls.length < MAX_PHOTOS && (
+              <div className="flex items-center gap-2 mb-3">
+                {/* Dois botões de propósito: o celular só abre a câmera direto
+                    quando o input pede uma foto de cada vez. Juntar "escolher
+                    várias" no mesmo botão faria a câmera parar de abrir. */}
+                <label
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-medium cursor-pointer"
+                  style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-secondary)", opacity: uploadingPhoto ? 0.5 : 1 }}
+                >
+                  <Camera size={15} />
+                  Take photo / Tirar foto
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    className="hidden"
+                    disabled={uploadingPhoto}
+                    onChange={handlePhotos}
                   />
-                  <button
-                    onClick={removePhoto}
-                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center"
-                    style={{ background: "#ef4444", color: "#fff" }}
-                  >
-                    <X size={10} />
-                  </button>
-                </div>
-              )}
-            </div>
+                </label>
+                <label
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-medium cursor-pointer"
+                  style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-secondary)", opacity: uploadingPhoto ? 0.5 : 1 }}
+                >
+                  <ImagePlus size={15} />
+                  Gallery / Galeria
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    disabled={uploadingPhoto}
+                    onChange={handlePhotos}
+                  />
+                </label>
+              </div>
+            )}
+
+            {uploadingPhoto && (
+              <div className="flex items-center gap-2 mb-3">
+                <div className="w-4 h-4 border-2 rounded-full animate-spin" style={{ borderColor: "var(--accent-amber)", borderTopColor: "transparent" }} />
+                <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  Sending {uploadProgress?.done ?? 0} of {uploadProgress?.total ?? 0} / Enviando {uploadProgress?.done ?? 0} de {uploadProgress?.total ?? 0}...
+                </span>
+              </div>
+            )}
+
+            {photoUrls.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {photoUrls.map((url, i) => (
+                  <div key={url + i} className="relative">
+                    <img
+                      src={url}
+                      alt={`Fuel photo ${i + 1}`}
+                      className="w-16 h-16 rounded object-cover"
+                      style={{ border: "1px solid var(--border-divider)" }}
+                    />
+                    <span
+                      className="absolute bottom-0 left-0 px-1 mono-font"
+                      style={{ background: "rgba(0,0,0,0.65)", color: "#fff", fontSize: 9, borderTopRightRadius: 4, borderBottomLeftRadius: 4 }}
+                    >
+                      {i + 1}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removePhoto(i)}
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center"
+                      style={{ background: "#ef4444", color: "#fff" }}
+                      aria-label="Remove photo / Remover foto"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <p className="text-xs mt-2" style={{ color: "var(--text-muted)" }}>
+              Receipt, pump display, odometer. / Cupom, painel da bomba, odômetro.
+            </p>
           </div>
         </div>
 

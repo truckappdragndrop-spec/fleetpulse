@@ -70,6 +70,14 @@ service cloud.firestore {
     // ───────── caminhões ─────────
     // Motorista precisa ver a frota para escolher o caminhão, e precisa
     // gravar a milhagem ao abastecer — só isso.
+    //
+    // Nota sobre a milhagem: seria bom a regra exigir que `currentKm` nunca
+    // ande para trás, mas o campo está gravado como TEXTO, e a linguagem de
+    // regras não converte texto em número — comparar "9000" com "50312" dá o
+    // resultado errado, porque a comparação vira alfabética. A checagem
+    // continua sendo a da tela do motorista. Para valer no servidor, o caminho
+    // é gravar também um `currentKmNumber` numérico; é uma migração e fica
+    // para quando você quiser.
     match /trucks/{truckId} {
       allow read: if signedIn();
       allow create, delete: if isAdmin();
@@ -78,15 +86,20 @@ service cloud.firestore {
     }
 
     // ───────── checklists do motorista ─────────
-    // O motorista cria o próprio checklist e só enxerga os dele.
+    // O motorista cria o próprio checklist e enxerga os da frota.
     // Aprovar, resolver e apagar é do admin.
     match /driverChecklists/{docId} {
-      // Nota: aqui o campo é acessado direto (resource.data.driverEmail) e não
-      // com .get(). Em consultas de lista o Firestore precisa casar a regra com
-      // o filtro `where("driverEmail", "==", ...)` da query, e ele não consegue
-      // fazer esse casamento através de um .get() com valor padrão.
-      allow read: if isAdmin() ||
-        (isDriver() && resource.data.driverEmail == email());
+      // Leitura liberada para qualquer usuário autenticado.
+      //
+      // O motorista precisa ver os problemas em aberto do caminhão que vai
+      // dirigir, tenha sido ele quem reportou ou não — senão reporta de novo o
+      // que a oficina já sabe. Como o problema pertence ao veículo e não à
+      // pessoa, a leitura deixou de ser restrita ao próprio e-mail.
+      //
+      // O que isso expõe: um motorista consegue ler os checklists dos colegas
+      // (nome, e-mail e o que reportaram). Escrever continua fechado: cada um
+      // só cria o próprio, e alterar ou apagar é do administrador.
+      allow read: if signedIn();
       allow create: if isAdmin() ||
         (isDriver() && request.resource.data.driverEmail == email());
       allow update, delete: if isAdmin();
@@ -94,9 +107,33 @@ service cloud.firestore {
 
     // ───────── abastecimentos ─────────
     // O motorista registra; conferir e corrigir é do admin.
+    //
+    // Antes era `allow create: if signedIn()`, sem conferir nada. Dois furos:
+    // o motorista podia gravar abastecimento no nome de outro (e aí o registro
+    // deixa de valer como prova), e não havia teto nenhum — um laço num script
+    // gravava cem mil documentos, que você pagaria no fim do mês.
+    //
+    // O admin continua livre: ele corrige e importa registro antigo pela tela
+    // de Fuel, e não faz sentido amarrar a mão de quem já pode tudo.
+    function validFuelRecord() {
+      let d = request.resource.data;
+      return
+        // O e-mail vem do login e não pode ser inventado — diferente do nome.
+        d.get('driverEmail', '') == email()
+        && d.get('truckId', '') is string
+        && d.truckId.size() > 0 && d.truckId.size() < 64
+        && d.get('liters', '') is string
+        && d.liters.size() > 0 && d.liters.size() < 12
+        && d.get('fuelDate', '') is string
+        && d.fuelDate.size() <= 10
+        // Documento gordo demais é sinal de que não veio do app.
+        && d.keys().size() <= 25
+        && (!('photoUrls' in d) || (d.photoUrls is list && d.photoUrls.size() <= 5));
+    }
+
     match /fuelRecords/{docId} {
       allow read: if isAdmin();
-      allow create: if signedIn();
+      allow create: if isAdmin() || (isDriver() && validFuelRecord());
       allow update, delete: if isAdmin();
     }
 
@@ -111,6 +148,13 @@ service cloud.firestore {
     }
 
     match /partsHistory/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ───────── contadores ─────────
+    // Hoje guarda só o próximo número de ordem de serviço
+    // (counters/workOrders). Quem cria manutenção precisa incrementar.
+    match /counters/{counterId} {
       allow read, write: if isAdmin();
     }
 

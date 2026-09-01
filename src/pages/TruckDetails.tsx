@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useParams, useNavigate, Link } from "react-router";
 import { useCollection } from "@/hooks/useCollection";
 import {
@@ -11,8 +11,15 @@ import {
   AlertTriangle,
   FileText,
   Package,
+  ClipboardCheck,
+  ShieldCheck,
+  Camera,
+  User,
 } from "lucide-react";
-import type { Timestamp } from "firebase/firestore";
+import { collection, getDocs, query, where, type Timestamp } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { pmStatusForTruck, PM_COLORS } from "@/lib/preventive";
+import { displayWoNumber } from "@/lib/workOrderNumber";
 
 interface TruckDoc {
   id: string;
@@ -28,7 +35,36 @@ interface TruckDoc {
   notes?: string;
   vin?: string;
   engine?: string;
+  registrationExpiry?: string;
+  insuranceExpiry?: string;
+  inspectionExpiry?: string;
+  lastOilChangeMiles?: string;
+  oilChangeInterval?: string;
   createdAt: Timestamp;
+}
+
+interface ChecklistDoc {
+  id: string;
+  truckId: string;
+  driverName?: string;
+  driverEmail?: string;
+  submittedAt: string;
+  status: string;
+  odometer?: number;
+  fuelLevel?: number;
+  issues?: string;
+  issuesResolved?: boolean;
+  resolvedItems?: string[];
+  checklist?: {
+    id: string;
+    label: string;
+    labelPt?: string;
+    status?: "ok" | "fair" | "bad" | null;
+    checked?: boolean;
+    notes?: string;
+    photoUrl?: string;
+    woNumber?: string;
+  }[];
 }
 
 interface MaintDoc {
@@ -131,12 +167,42 @@ function safeNum(value: any): number {
 export default function TruckDetails() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<"overview" | "maintenance" | "fuel" | "parts">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "checklists" | "maintenance" | "fuel" | "parts">("overview");
+
+  // Checklists deste caminhão. Busca só por truckId e ordena aqui no navegador
+  // de propósito: assim não exige um índice novo no Firestore.
+  const [checklists, setChecklists] = useState<ChecklistDoc[]>([]);
+  const [checklistsLoading, setChecklistsLoading] = useState(true);
+  const [checklistsError, setChecklistsError] = useState(false);
 
   const { data: trucks } = useCollection<TruckDoc>("trucks");
   const { data: maintenance } = useCollection<MaintDoc>("maintenance");
   const { data: fuelRecords } = useCollection<FuelDoc>("fuelRecords");
   const { data: allParts } = useCollection<PartDoc>("parts");
+
+  useEffect(() => {
+    if (!id) return;
+    let alive = true;
+    (async () => {
+      setChecklistsLoading(true);
+      setChecklistsError(false);
+      try {
+        const snap = await getDocs(
+          query(collection(db, "driverChecklists"), where("truckId", "==", id))
+        );
+        if (!alive) return;
+        const list = snap.docs.map(d => ({ id: d.id, ...d.data() } as ChecklistDoc));
+        list.sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""));
+        setChecklists(list);
+      } catch (err) {
+        console.error("Error loading truck checklists:", err);
+        if (alive) setChecklistsError(true);
+      } finally {
+        if (alive) setChecklistsLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [id]);
 
   const truck = trucks.find((t) => t.id === id);
 
@@ -228,6 +294,66 @@ export default function TruckDetails() {
   const lastFuel = truckFuel[0];
   const lastMaint = truckMaintenance[0];
 
+  // ── Saúde do caminhão ────────────────────────────────────────────
+  // Documentos e troca de óleo já existiam no cadastro e só apareciam
+  // somados no Dashboard. Aqui respondem por UM caminhão.
+  const daysUntil = (value?: string): number | null => {
+    if (!value) return null;
+    const d = new Date(value + "T00:00:00");
+    if (isNaN(d.getTime())) return null;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return Math.ceil((d.getTime() - today.getTime()) / 86400000);
+  };
+
+  const documents = [
+    { label: "Registration", value: truck?.registrationExpiry },
+    { label: "Insurance", value: truck?.insuranceExpiry },
+    { label: "DOT Inspection", value: truck?.inspectionExpiry },
+  ].map((doc) => {
+    const days = daysUntil(doc.value);
+    return {
+      ...doc,
+      days,
+      color:
+        days === null ? "var(--text-muted)"
+          : days < 0 ? "var(--accent-red)"
+        : days <= 30 ? "var(--accent-amber)"
+        : "var(--accent-green)",
+      text:
+        days === null ? "Not registered"
+        : days < 0 ? `expired ${Math.abs(days)} days ago`
+        : days === 0 ? "expires today"
+        : `expires in ${days} days`,
+    };
+  });
+
+  const oil = (() => {
+    const last = Number(truck?.lastOilChangeMiles) || 0;
+    const interval = Number(truck?.oilChangeInterval) || 0;
+    const current = Number(truck?.currentKm) || 0;
+    if (last <= 0 || interval <= 0) return null;
+    const remaining = last + interval - current;
+    const used = Math.min(100, Math.max(0, ((current - last) / interval) * 100));
+    return { last, interval, remaining, pct: used };
+  })();
+
+  // Manutenção preventiva deste caminhão: todas as regras, inclusive as que
+  // estão em dia. Aqui é a página do caminhão — é exatamente onde se quer ver
+  // a lista inteira, e não só o que está pegando fogo.
+  const pmList = truck ? pmStatusForTruck({ ...(truck as any), id: truck.id }, truckMaintenance as any) : [];
+
+  const openWorkOrders = truckMaintenance.filter((m) => m.status !== "completed");
+
+  const openChecklistIssues = checklists.reduce((sum, report) => {
+    const resolved = report.resolvedItems || [];
+    const items = report.checklist || [];
+    return sum + items.filter((i) => {
+      const state = i.status || (i.checked ? "ok" : "bad");
+      return state !== "ok" && !resolved.includes(i.id);
+    }).length;
+  }, 0);
+
   const getStatusColor = (s: string) =>
     ({
       active: "var(--accent-green)",
@@ -293,9 +419,10 @@ export default function TruckDetails() {
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 p-1 rounded-xl" style={{ background: "rgba(255,255,255,0.04)" }}>
+      <div className="flex gap-1 p-1 rounded-xl overflow-x-auto" style={{ background: "rgba(255,255,255,0.04)" }}>
         {[
           { key: "overview", label: "Overview", icon: FileText },
+          { key: "checklists", label: "Checklists", icon: ClipboardCheck },
           { key: "maintenance", label: "Maintenance", icon: Wrench },
           { key: "fuel", label: "Fuel", icon: Droplets },
           { key: "parts", label: "Parts Used", icon: Package },
@@ -309,6 +436,119 @@ export default function TruckDetails() {
 
       {/* Overview Tab */}
       {activeTab === "overview" && (
+        <div className="space-y-4">
+          {/* Situação do caminhão: documentos, óleo e o que está em aberto */}
+          <div className="glass-card p-5">
+            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2" style={{ color: "var(--text-primary)" }}>
+              <ShieldCheck size={18} style={{ color: "var(--accent-green)" }} />
+              Status & Compliance
+              <span className="text-sm font-normal" style={{ color: "var(--text-muted)" }}>/ Situação</span>
+            </h2>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {documents.map((doc) => (
+                <div key={doc.label} className="p-3 rounded-xl" style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${doc.color}33` }}>
+                  <p className="text-xs uppercase tracking-wider mb-1" style={{ color: "var(--text-muted)" }}>{doc.label}</p>
+                  <p className="mono-font text-sm" style={{ color: "var(--text-primary)" }}>
+                    {doc.value ? new Date(doc.value + "T00:00:00").toLocaleDateString("en-US") : "—"}
+                  </p>
+                  <p className="text-xs mt-1 font-medium" style={{ color: doc.color }}>{doc.text}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+              <div className="p-3 rounded-xl" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--border-divider)" }}>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Oil Change / Troca de óleo</p>
+                  {oil && (
+                    <span className="mono-font text-sm font-bold" style={{ color: oil.remaining <= 0 ? "var(--accent-red)" : oil.remaining <= 1000 ? "var(--accent-amber)" : "var(--accent-green)" }}>
+                      {oil.remaining <= 0
+                        ? `${Math.abs(oil.remaining).toLocaleString()} mi overdue`
+                        : `${oil.remaining.toLocaleString()} mi left`}
+                    </span>
+                  )}
+                </div>
+                {oil ? (
+                  <>
+                    <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
+                      <div className="h-full rounded-full transition-all duration-700" style={{ width: oil.pct + "%", background: oil.remaining <= 0 ? "var(--accent-red)" : oil.remaining <= 1000 ? "var(--accent-amber)" : "var(--accent-green)" }} />
+                    </div>
+                    <p className="text-xs mt-1.5" style={{ color: "var(--text-muted)" }}>
+                      Last change at {oil.last.toLocaleString()} mi • every {oil.interval.toLocaleString()} mi
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                    Fill in the last oil change and the interval on the truck to track this.
+                  </p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <Link to="/maintenance" className="p-3 rounded-xl block" style={{ background: openWorkOrders.length > 0 ? "rgba(232,168,56,0.08)" : "rgba(255,255,255,0.03)", border: `1px solid ${openWorkOrders.length > 0 ? "rgba(232,168,56,0.3)" : "var(--border-divider)"}` }}>
+                  <p className="text-xs uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Open work orders</p>
+                  <p className="text-2xl font-bold mono-font" style={{ color: openWorkOrders.length > 0 ? "var(--accent-amber)" : "var(--text-secondary)" }}>{openWorkOrders.length}</p>
+                  {openWorkOrders.length > 0 && (
+                    <p className="text-xs truncate" style={{ color: "var(--text-muted)" }}>
+                      {openWorkOrders.slice(0, 2).map(m => displayWoNumber(m)).join(", ")}
+                    </p>
+                  )}
+                </Link>
+
+                <button onClick={() => setActiveTab("checklists")} className="p-3 rounded-xl text-left" style={{ background: openChecklistIssues > 0 ? "rgba(239,68,68,0.07)" : "rgba(255,255,255,0.03)", border: `1px solid ${openChecklistIssues > 0 ? "rgba(239,68,68,0.3)" : "var(--border-divider)"}` }}>
+                  <p className="text-xs uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Open issues</p>
+                  <p className="text-2xl font-bold mono-font" style={{ color: openChecklistIssues > 0 ? "var(--accent-red)" : "var(--text-secondary)" }}>{openChecklistIssues}</p>
+                  <p className="text-xs" style={{ color: "var(--text-muted)" }}>from driver checklists</p>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Manutenção preventiva: o que vence por milhagem e por tempo */}
+          {pmList.length > 0 && (
+            <div className="glass-card p-5">
+              <h2 className="text-lg font-semibold mb-1 flex items-center gap-2" style={{ color: "var(--text-primary)" }}>
+                <Wrench size={18} style={{ color: "var(--accent-amber)" }} />
+                Preventive Maintenance
+                <span className="text-sm font-normal" style={{ color: "var(--text-muted)" }}>/ Manutenção preventiva</span>
+              </h2>
+              <p className="text-xs mb-4" style={{ color: "var(--text-muted)" }}>
+                The clock resets when a work order of the same type is completed. / O relógio zera quando uma ordem de serviço do mesmo tipo é concluída.
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {pmList.map((p) => {
+                  const color = PM_COLORS[p.severity];
+                  return (
+                    <div
+                      key={p.key}
+                      className="p-3 rounded-xl"
+                      style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--border-divider)", borderLeft: `3px solid ${color}` }}
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium truncate" style={{ color: "var(--text-primary)" }}>{p.label}</p>
+                          <p className="text-[11px] truncate" style={{ color: "var(--text-muted)" }}>{p.labelPt}</p>
+                        </div>
+                        <span className="mono-font text-sm font-bold whitespace-nowrap" style={{ color }}>{p.detail}</span>
+                      </div>
+                      <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
+                        <div className="h-full rounded-full transition-all duration-700" style={{ width: p.pct + "%", background: color }} />
+                      </div>
+                      <p className="text-[11px] mt-1.5" style={{ color: "var(--text-muted)" }}>
+                        {p.lastMiles ? `Last at ${p.lastMiles.toLocaleString("en-US")} mi` : "No mileage on record"}
+                        {p.lastDate && ` • ${p.lastDate.toLocaleDateString("en-US")}`}
+                        {p.intervalMiles > 0 && ` • every ${p.intervalMiles.toLocaleString("en-US")} mi`}
+                        {p.intervalMonths > 0 && ` • every ${p.intervalMonths} mo`}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="glass-card p-5">
             <h2 className="text-lg font-semibold mb-4" style={{ color: "var(--text-primary)" }}>Vehicle Information</h2>
@@ -374,6 +614,127 @@ export default function TruckDetails() {
               <h2 className="text-lg font-semibold mb-3" style={{ color: "var(--text-primary)" }}>Notes</h2>
               <p className="text-sm" style={{ color: "var(--text-secondary)" }}>{truck.notes}</p>
             </div>
+          )}
+          </div>
+        </div>
+      )}
+
+      {/* Checklists Tab */}
+      {activeTab === "checklists" && (
+        <div className="space-y-4">
+          {checklistsLoading ? (
+            <div className="flex justify-center py-12">
+              <div className="w-8 h-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--accent-amber)", borderTopColor: "transparent" }} />
+            </div>
+          ) : checklistsError ? (
+            <div className="glass-card p-8 text-center">
+              <AlertTriangle size={40} className="mx-auto mb-3" style={{ color: "var(--accent-red)" }} />
+              <p style={{ color: "var(--text-primary)" }}>Could not load the checklists</p>
+              <p className="text-sm mt-1" style={{ color: "var(--text-muted)" }}>Veja o console do navegador para o motivo.</p>
+            </div>
+          ) : checklists.length === 0 ? (
+            <div className="glass-card p-8 text-center">
+              <ClipboardCheck size={40} className="mx-auto mb-3 opacity-30" style={{ color: "var(--text-muted)" }} />
+              <p style={{ color: "var(--text-muted)" }}>No checklists for this truck yet / Nenhum checklist deste caminhão.</p>
+            </div>
+          ) : (
+            checklists.map((report) => {
+              const resolved = report.resolvedItems || [];
+              const items = (report.checklist || []).map((i) => ({
+                ...i,
+                state: i.status || (i.checked ? "ok" : "bad"),
+              }));
+              const problems = items.filter((i) => i.state !== "ok");
+              const stillOpen = problems.filter((i) => !resolved.includes(i.id));
+
+              return (
+                <div key={report.id} className="glass-card p-4">
+                  <div className="flex flex-wrap items-center gap-3 justify-between">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="flex items-center justify-center rounded-lg flex-shrink-0" style={{ width: 38, height: 38, background: stillOpen.length > 0 ? "rgba(239,68,68,0.12)" : "rgba(74,155,106,0.12)" }}>
+                        {stillOpen.length > 0
+                          ? <AlertTriangle size={18} style={{ color: "var(--accent-red)" }} />
+                          : <ClipboardCheck size={18} style={{ color: "var(--accent-green)" }} />}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-medium text-sm" style={{ color: "var(--text-primary)" }}>
+                          {new Date(report.submittedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
+                        </p>
+                        <p className="text-xs flex items-center gap-1 truncate" style={{ color: "var(--text-muted)" }}>
+                          <User size={11} /> {report.driverName || report.driverEmail || "—"}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-3 text-xs" style={{ color: "var(--text-muted)" }}>
+                      {typeof report.odometer === "number" && (
+                        <span className="mono-font">{report.odometer.toLocaleString()} mi</span>
+                      )}
+                      {typeof report.fuelLevel === "number" && <span>{report.fuelLevel}% fuel</span>}
+                      <span className="px-2 py-1 rounded-full font-semibold" style={{
+                        background: stillOpen.length > 0 ? "rgba(239,68,68,0.12)" : "rgba(74,155,106,0.12)",
+                        color: stillOpen.length > 0 ? "var(--accent-red)" : "var(--accent-green)",
+                      }}>
+                        {stillOpen.length > 0 ? `${stillOpen.length} open` : "All resolved"}
+                      </span>
+                    </div>
+                  </div>
+
+                  {problems.length > 0 && (
+                    <div className="mt-3 space-y-2">
+                      {problems.map((item) => {
+                        const isResolved = resolved.includes(item.id);
+                        return (
+                          <div key={item.id} className="flex items-start gap-2 p-2 rounded-lg" style={{
+                            background: "rgba(255,255,255,0.03)",
+                            border: "1px solid var(--border-divider)",
+                            opacity: isResolved ? 0.55 : 1,
+                          }}>
+                            <span className="rounded-full flex-shrink-0 mt-1.5" style={{
+                              width: 7, height: 7,
+                              background: isResolved ? "var(--accent-green)" : item.state === "bad" ? "var(--accent-red)" : "var(--accent-amber)",
+                            }} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm" style={{ color: "var(--text-primary)", textDecoration: isResolved ? "line-through" : "none" }}>
+                                {item.label}
+                                <span className="ml-2 text-xs font-bold uppercase" style={{ color: item.state === "bad" ? "var(--accent-red)" : "var(--accent-amber)" }}>
+                                  {item.state}
+                                </span>
+                              </p>
+                              {item.notes && (
+                                <p className="text-xs mt-0.5" style={{ color: "var(--text-muted)" }}>{item.notes}</p>
+                              )}
+                            </div>
+                            {item.woNumber && (
+                              <span className="mono-font text-xs font-semibold px-1.5 py-0.5 rounded whitespace-nowrap" style={{ background: "rgba(74,155,106,0.15)", color: "var(--accent-green)" }}>
+                                {item.woNumber}
+                              </span>
+                            )}
+                            {item.photoUrl && (
+                              <a href={item.photoUrl} target="_blank" rel="noreferrer" title="Open photo" className="flex-shrink-0" style={{ color: "var(--text-muted)" }}>
+                                <Camera size={15} />
+                              </a>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {report.issues && (
+                    <p className="text-xs mt-3 p-2 rounded-lg" style={{
+                      background: report.issuesResolved ? "rgba(74,155,106,0.08)" : "rgba(239,68,68,0.08)",
+                      color: "var(--text-secondary)",
+                    }}>
+                      <span className="font-semibold" style={{ color: report.issuesResolved ? "var(--accent-green)" : "var(--accent-red)" }}>
+                        {report.issuesResolved ? "Notes (resolved): " : "Notes: "}
+                      </span>
+                      {report.issues}
+                    </p>
+                  )}
+                </div>
+              );
+            })
           )}
         </div>
       )}

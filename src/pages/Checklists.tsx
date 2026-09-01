@@ -1,10 +1,14 @@
 import { useState, useEffect } from "react";
-import { collection, getDocs, doc, deleteDoc, updateDoc, addDoc, serverTimestamp, deleteField } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { useSearchParams } from "react-router";
+import { collection, getDocs, doc, deleteDoc, updateDoc, addDoc, serverTimestamp, deleteField, query, orderBy, limit } from "firebase/firestore";
+import { auth, db } from "@/lib/firebase";
+import { useDialogs } from "@/components/Dialogs";
+import { nextWorkOrderNumber } from "@/lib/workOrderNumber";
+import { itemState } from "@/lib/checklistLink";
 import {
   ClipboardCheck, AlertTriangle, CheckCircle2,
   ChevronDown, ChevronUp, RefreshCw, Truck, User, Gauge, Fuel, MinusCircle, Calendar,
-  Trash2, Wrench, X, Minus, Plus
+  Trash2, Wrench, X, Minus, Plus, Search, ArrowUpDown, ArrowUp, ArrowDown
 } from "lucide-react";
 
 interface ChecklistItem {
@@ -18,6 +22,7 @@ interface ChecklistItem {
   photoUrl?: string;
   woCreated?: boolean;
   woId?: string;
+  woNumber?: string;
 }
 
 interface ChecklistReport {
@@ -32,8 +37,22 @@ interface ChecklistReport {
   status: string;
   submittedAt: string;
   resolvedAt?: string;
+  /** E-mail de quem encerrou o checklist. */
+  resolvedBy?: string;
   resolvedItems?: string[];
   issuesResolved?: boolean;
+  /** Ordem de serviço aberta a partir do campo livre "Issues". */
+  issuesWoNumber?: string;
+  /** Confirmação do motorista no envio — o equivalente à assinatura. */
+  certified?: boolean;
+  certifiedBy?: string;
+  certifiedAt?: string;
+  /** Problemas do relatório anterior que o motorista declarou ter revisado. */
+  acknowledgedIssues?: { id: string; label: string; reportId: string }[];
+  acknowledgedAt?: string;
+  /** Certificação de reparo: exigida antes do caminhão voltar à rota. */
+  repairCertifiedBy?: string;
+  repairCertifiedAt?: string;
   checklist: ChecklistItem[];
 }
 
@@ -45,11 +64,6 @@ interface PartOption {
 }
 
 // Compatível com formato novo (status) e antigo (checked)
-function itemState(item: ChecklistItem): "ok" | "fair" | "bad" {
-  if (item.status === "ok" || item.status === "fair" || item.status === "bad") return item.status;
-  return item.checked ? "ok" : "bad";
-}
-
 function statusStyle(status: string) {
   if (status === "approved")
     return { label: "Approved", color: "var(--accent-green)", bg: "rgba(74,155,106,0.15)" };
@@ -59,6 +73,7 @@ function statusStyle(status: string) {
 }
 
 export default function Checklists() {
+  const { confirm, notify } = useDialogs();
   const [reports, setReports] = useState<ChecklistReport[]>([]);
   const [parts, setParts] = useState<PartOption[]>([]);
   const [loading, setLoading] = useState(true);
@@ -66,6 +81,47 @@ export default function Checklists() {
   const [filter, setFilter] = useState<"all" | "needs_review" | "approved" | "resolved">("needs_review");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [photoView, setPhotoView] = useState<string | null>(null);
+
+  // Busca por texto (caminhão ou motorista) e ordenação da tabela.
+  // Chegando de /checklists?wo=WO-0042 (atalho da tela de Manutenção),
+  // a busca já vem preenchida com o número da ordem.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [search, setSearch] = useState(searchParams.get("wo") || "");
+
+  useEffect(() => {
+    const wo = searchParams.get("wo");
+    if (!wo) return;
+    setSearch(wo);
+    setFilter("all");          // a ordem pode ter vindo de um checklist já resolvido
+    setDateMode("all");
+    searchParams.delete("wo"); // limpa o endereço para não "grudar" a busca
+    setSearchParams(searchParams, { replace: true });
+  }, [searchParams, setSearchParams]);
+  type ChecklistSortField = "date" | "truck" | "problems";
+  const [sortField, setSortField] = useState<ChecklistSortField>("date");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  const toggleSort = (field: ChecklistSortField) => {
+    setSortField(prev => {
+      if (prev === field) {
+        setSortDir(d => (d === "desc" ? "asc" : "desc"));
+        return prev;
+      }
+      setSortDir(field === "truck" ? "asc" : "desc");
+      return field;
+    });
+  };
+
+  const sortIcon = (field: ChecklistSortField) => {
+    if (sortField !== field) return <ArrowUpDown size={12} className="opacity-40" />;
+    return sortDir === "desc" ? <ArrowDown size={12} /> : <ArrowUp size={12} />;
+  };
+
+  // Paginação: antes esta tela baixava TODOS os checklists já enviados a cada
+  // vez que era aberta — e a coleção só cresce. Agora vem um lote por vez.
+  const PAGE_SIZE = 100;
+  const [pageLimit, setPageLimit] = useState(PAGE_SIZE);
+  const [hasMore, setHasMore] = useState(false);
 
   // Quick date search (day / month / year)
   const [dateMode, setDateMode] = useState<"all" | "day" | "month" | "year">("all");
@@ -81,18 +137,28 @@ export default function Checklists() {
   const [woQty, setWoQty] = useState<Record<string, number>>({});
   const [woSaving, setWoSaving] = useState(false);
 
-  const loadReports = async () => {
+  const loadReports = async (max: number = pageLimit) => {
     setLoading(true);
     try {
-      const snap = await getDocs(collection(db, "driverChecklists"));
+      const snap = await getDocs(
+        query(collection(db, "driverChecklists"), orderBy("submittedAt", "desc"), limit(max))
+      );
       const list = snap.docs.map(d => ({ id: d.id, ...d.data() } as ChecklistReport));
       list.sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""));
       setReports(list);
+      // Se veio o lote cheio, provavelmente ainda há mais no banco.
+      setHasMore(snap.size === max);
     } catch (err) {
       console.error("Error loading checklists:", err);
     } finally {
       setLoading(false);
     }
+  };
+
+  const loadMore = () => {
+    const next = pageLimit + PAGE_SIZE;
+    setPageLimit(next);
+    loadReports(next);
   };
 
   const loadParts = async () => {
@@ -117,33 +183,56 @@ export default function Checklists() {
   useEffect(() => { loadReports(); loadParts(); }, []);
 
   const handleDelete = async (id: string) => {
-    if (!window.confirm("Delete this checklist? / Deletar este checklist?")) return;
+    const ok = await confirm({
+      title: "Delete this checklist?",
+      message: "Deletar este checklist? Esta ação não pode ser desfeita.",
+      confirmLabel: "Delete",
+      cancelLabel: "Cancel",
+      danger: true,
+    });
+    if (!ok) return;
     setBusyId(id);
     try {
       await deleteDoc(doc(db, "driverChecklists", id));
       setReports(prev => prev.filter(r => r.id !== id));
     } catch (err) {
       console.error("Error deleting checklist:", err);
-      alert("Could not delete / Não foi possível deletar");
+      notify("Could not delete / Não foi possível deletar", "error");
     } finally {
       setBusyId(null);
     }
   };
 
+  /** Quem está operando agora — fica gravado junto com a resolução. */
+  const currentUser = () => auth.currentUser?.email || "";
+
   const handleMarkFixed = async (id: string) => {
+    // Defeito de segurança exige certificação escrita antes de o caminhão
+    // voltar à rota — não é um "ok" qualquer, é uma declaração.
+    const ok = await confirm({
+      title: "Certify the repair?",
+      message: "Declaro que os defeitos reportados foram reparados, ou que não afetam a operação segura do veículo. Fica registrado com o seu e-mail e a data.",
+      confirmLabel: "Certify / Certificar",
+    });
+    if (!ok) return;
+
     setBusyId(id);
     try {
       const resolvedAt = new Date().toISOString();
+      const resolvedBy = currentUser();
       await updateDoc(doc(db, "driverChecklists", id), {
         status: "resolved",
-        resolvedAt
+        resolvedAt,
+        resolvedBy,
+        repairCertifiedBy: resolvedBy,
+        repairCertifiedAt: resolvedAt
       });
       setReports(prev => prev.map(r =>
-        r.id === id ? { ...r, status: "resolved", resolvedAt } : r
+        r.id === id ? { ...r, status: "resolved", resolvedAt, resolvedBy, repairCertifiedBy: resolvedBy, repairCertifiedAt: resolvedAt } : r
       ));
     } catch (err) {
       console.error("Error updating checklist:", err);
-      alert("Could not update / Não foi possível atualizar");
+      notify("Could not update / Não foi possível atualizar", "error");
     } finally {
       setBusyId(null);
     }
@@ -158,12 +247,14 @@ export default function Checklists() {
 
     if (!hasUnresolvedItems && !hasUnresolvedIssues) {
       const resolvedAt = new Date().toISOString();
+      const resolvedBy = currentUser();
       await updateDoc(doc(db, "driverChecklists", report.id), {
         status: "resolved",
-        resolvedAt
+        resolvedAt,
+        resolvedBy
       });
       setReports(prev => prev.map(r =>
-        r.id === report.id ? { ...r, status: "resolved", resolvedAt } : r
+        r.id === report.id ? { ...r, status: "resolved", resolvedAt, resolvedBy } : r
       ));
     }
   };
@@ -202,7 +293,7 @@ export default function Checklists() {
       }
     } catch (err) {
       console.error("Error updating item:", err);
-      alert("Could not update item / Não foi possível atualizar item");
+      notify("Could not update item / Não foi possível atualizar item", "error");
     } finally {
       setBusyId(null);
     }
@@ -237,7 +328,7 @@ export default function Checklists() {
       }
     } catch (err) {
       console.error("Error updating issues:", err);
-      alert("Could not update issues / Não foi possível atualizar issues");
+      notify("Could not update issues / Não foi possível atualizar issues", "error");
     } finally {
       setBusyId(null);
     }
@@ -270,7 +361,11 @@ export default function Checklists() {
       const { report, item, fromIssues } = woDialog;
       const woParts = woPartsPreview.map(p => ({ id: p.id, name: p.name, qty: p.qty, unitCost: p.cost }));
 
+      // Reserva o número antes de gravar, para que ele já nasça no registro.
+      const { number: woNumber, provisional } = await nextWorkOrderNumber();
+
       const woRef = await addDoc(collection(db, "maintenance"), {
+        woNumber,
         truckId: report.truckId,
         truckName: report.truckName || report.truckId,
         title: fromIssues ? "Issues from Driver Checklist" : (item?.label || "Checklist Issue"),
@@ -300,10 +395,16 @@ export default function Checklists() {
         }
       }
 
+      // WO aberta a partir do campo livre "Issues": o número fica no relatório.
+      if (!item) {
+        await updateDoc(doc(db, "driverChecklists", report.id), { issuesWoNumber: woNumber });
+        setReports(prev => prev.map(r => r.id === report.id ? { ...r, issuesWoNumber: woNumber } : r));
+      }
+
       // Marca o item do checklist como WO criada (se for de um item específico)
       if (item) {
         const updatedChecklist = (report.checklist || []).map(ci =>
-          ci.id === item.id ? { ...ci, woCreated: true, woId: woRef.id } : ci
+          ci.id === item.id ? { ...ci, woCreated: true, woId: woRef.id, woNumber } : ci
         );
         await updateDoc(doc(db, "driverChecklists", report.id), { checklist: updatedChecklist });
         setReports(prev => prev.map(r => r.id === report.id ? { ...r, checklist: updatedChecklist } : r));
@@ -311,9 +412,15 @@ export default function Checklists() {
 
       setParts(prev => prev.map(p => (woQty[p.id] || 0) > 0 ? { ...p, quantity: Math.max(0, p.quantity - (woQty[p.id] || 0)) } : p));
       setWoDialog(null);
+      notify(
+        provisional
+          ? `${woNumber} created with a temporary number / número provisório`
+          : `${woNumber} created / criada`,
+        provisional ? "warning" : "success"
+      );
     } catch (err) {
       console.error("Error creating WO:", err);
-      alert("Could not create Work Order / Não foi possível criar a WO");
+      notify("Could not create Work Order / Não foi possível criar a WO", "error");
     } finally {
       setWoSaving(false);
     }
@@ -346,6 +453,34 @@ export default function Checklists() {
     if (dateMode === "month") return monthFilter ? ym === monthFilter : true;
     if (dateMode === "year") return yearFilter ? y === yearFilter : true;
     return true;
+  });
+
+  // Quantos itens ainda precisam de atenção neste checklist.
+  const attentionCountOf = (r: ChecklistReport) => {
+    const resolved = r.resolvedItems || [];
+    return (r.checklist || []).filter(i => itemState(i) !== "ok" && !resolved.includes(i.id)).length;
+  };
+
+  const term = search.trim().toLowerCase();
+  const searched = !term
+    ? filtered
+    : filtered.filter(r => {
+        const fields = [r.truckName, r.truckId, r.driverName, r.driverEmail, r.issuesWoNumber];
+        if (fields.some(v => (v || "").toLowerCase().includes(term))) return true;
+        // Também encontra pelo número da ordem de serviço gerada a partir
+        // de um item — é assim que se volta do papel para o checklist.
+        return (r.checklist || []).some(i => (i.woNumber || "").toLowerCase().includes(term));
+      });
+
+  const sorted = [...searched].sort((a, b) => {
+    const dir = sortDir === "desc" ? -1 : 1;
+    if (sortField === "truck") {
+      return (a.truckName || a.truckId || "").localeCompare(b.truckName || b.truckId || "", undefined, { numeric: true }) * dir;
+    }
+    if (sortField === "problems") {
+      return (attentionCountOf(a) - attentionCountOf(b)) * dir;
+    }
+    return (a.submittedAt || "").localeCompare(b.submittedAt || "") * dir;
   });
 
   const formatDate = (iso: string) => {
@@ -399,26 +534,50 @@ export default function Checklists() {
         </button>
       </div>
 
-      {/* Filters */}
-      <div className="flex gap-2 mb-6 flex-wrap">
-        {(["needs_review", "approved", "resolved", "all"] as const).map(f => (
-          <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className="px-4 py-2 rounded-lg text-sm font-medium"
-            style={{
-              background: filter === f ? "var(--accent-green)" : "var(--bg-secondary)",
-              color: filter === f ? "#fff" : "var(--text-secondary)",
-              border: "1px solid var(--border-divider)"
-            }}
-          >
-            {filterLabels[f]} ({counts[f]})
-          </button>
-        ))}
+      {/* Busca + status na mesma faixa, para o dado aparecer mais cedo na tela */}
+      <div className="flex flex-col sm:flex-row gap-2 mb-3">
+        <div className="relative flex-1 min-w-0">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }} />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search truck, driver or WO # / Buscar caminhão, motorista ou WO..."
+            className="w-full pl-9 pr-8 py-2 rounded-lg text-sm"
+            style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-divider)", color: "var(--text-primary)" }}
+          />
+          {search && (
+            <button
+              onClick={() => setSearch("")}
+              aria-label="Clear search"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded"
+              style={{ color: "var(--text-muted)" }}
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+
+        <div className="flex gap-1.5 flex-wrap">
+          {(["needs_review", "approved", "resolved", "all"] as const).map(f => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className="px-3 py-2 rounded-lg text-sm font-medium whitespace-nowrap"
+              style={{
+                background: filter === f ? "var(--accent-green)" : "var(--bg-secondary)",
+                color: filter === f ? "#fff" : "var(--text-secondary)",
+                border: "1px solid var(--border-divider)"
+              }}
+            >
+              {filterLabels[f]} ({counts[f]})
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Quick date search */}
-      <div className="flex items-center gap-2 mb-6 flex-wrap">
+      <div className="flex items-center gap-2 mb-4 flex-wrap">
         <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider mr-1" style={{ color: "var(--text-muted)" }}>
           <Calendar size={14} /> Date / Data:
         </span>
@@ -472,7 +631,7 @@ export default function Checklists() {
         )}
         {dateMode !== "all" && (
           <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-            {filtered.length} checklist{filtered.length !== 1 ? "s" : ""} found / encontrado{filtered.length !== 1 ? "s" : ""}
+            {sorted.length} checklist{sorted.length !== 1 ? "s" : ""} found / encontrado{sorted.length !== 1 ? "s" : ""}
           </span>
         )}
       </div>
@@ -482,7 +641,7 @@ export default function Checklists() {
         <div className="flex justify-center py-12">
           <div className="w-8 h-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--accent-green)", borderTopColor: "transparent" }} />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : sorted.length === 0 ? (
         <div className="glass-card p-8 text-center">
           <ClipboardCheck size={48} className="mx-auto mb-3 opacity-30" style={{ color: "var(--text-muted)" }} />
           <p style={{ color: "var(--text-muted)" }}>
@@ -491,94 +650,129 @@ export default function Checklists() {
         </div>
       ) : (
         <div className="space-y-4">
-          {/* Column headers */}
-          <div className="hidden md:grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_170px_140px] gap-4 px-4">
-            <p className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-muted)", paddingLeft: 60 }}>Truck</p>
-            <p className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Date / Data</p>
-            <p className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Status</p>
-            <span />
-          </div>
-          {filtered.map(report => {
-            const items = report.checklist || [];
-            const resolvedItems = report.resolvedItems || [];
-            const attention = items.filter(i => itemState(i) !== "ok" && !resolvedItems.includes(i.id));
-            const isOpen = expanded === report.id;
-            const st = statusStyle(report.status);
-            const itemsToShow = (filter === "all" || report.status === "approved") ? items : attention;
-
-            return (
-              <div key={report.id} className="glass-card overflow-hidden" style={{ opacity: busyId === report.id ? 0.6 : 1 }}>
-                {/* Card header */}
-                <div
-                  className="w-full p-4 flex flex-col gap-3 md:grid md:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_170px_140px] md:gap-4 md:items-center cursor-pointer"
-                  onClick={() => setExpanded(isOpen ? null : report.id)}
+          {/* Tabela compacta: uma linha por checklist, cabeçalhos ordenáveis */}
+          <div className="glass-card overflow-hidden">
+            <div
+              className="hidden md:grid grid-cols-[minmax(0,1.5fr)_minmax(0,0.9fr)_88px_128px_92px] gap-4 px-4 py-2.5"
+              style={{ borderBottom: "1px solid var(--border-divider)" }}
+            >
+              {([
+                { field: "truck", label: "Truck / Caminhão" },
+                { field: "date", label: "Date / Data" },
+                { field: "problems", label: "Issues" },
+              ] as { field: ChecklistSortField; label: string }[]).map(col => (
+                <button
+                  key={col.field}
+                  onClick={() => toggleSort(col.field)}
+                  className="flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider text-left"
+                  style={{ color: sortField === col.field ? "var(--accent-amber)" : "var(--text-muted)" }}
+                  title="Click to sort / Clique para ordenar"
                 >
-                  {/* Truck column */}
-                  <div className="flex items-center gap-4 min-w-0">
-                    <div
-                      className="flex items-center justify-center rounded-lg flex-shrink-0"
-                      style={{ width: 44, height: 44, background: st.bg }}
-                    >
-                      {report.status === "approved" && <CheckCircle2 size={22} style={{ color: st.color }} />}
-                      {report.status === "needs_review" && <AlertTriangle size={22} style={{ color: st.color }} />}
-                      {report.status === "resolved" && <Wrench size={22} style={{ color: st.color }} />}
-                    </div>
-                    <div className="min-w-0">
-                      <p className="font-semibold truncate" style={{ color: "var(--text-primary)" }}>
-                        {report.truckName || report.truckId}
-                      </p>
-                      <p className="text-xs truncate" style={{ color: "var(--text-muted)" }}>
-                        {report.driverName || report.driverEmail}
-                      </p>
-                    </div>
-                  </div>
+                  {col.label} {sortIcon(col.field)}
+                </button>
+              ))}
+              <p className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Status</p>
+              <span />
+            </div>
 
-                  {/* Date column */}
-                  <div className="min-w-0 pl-[60px] md:pl-0">
-                    <p className="text-sm flex items-center gap-1.5" style={{ color: "var(--text-secondary)" }}>
-                      <Calendar size={13} className="flex-shrink-0" style={{ color: "var(--text-muted)" }} />
+            {sorted.map(report => {
+              const items = report.checklist || [];
+              const resolvedItems = report.resolvedItems || [];
+              const attention = items.filter(i => itemState(i) !== "ok" && !resolvedItems.includes(i.id));
+              const isOpen = expanded === report.id;
+              const st = statusStyle(report.status);
+              const itemsToShow = (filter === "all" || report.status === "approved") ? items : attention;
+
+              return (
+                <div
+                  key={report.id}
+                  style={{
+                    opacity: busyId === report.id ? 0.6 : 1,
+                    borderBottom: "1px solid var(--border-divider)",
+                  }}
+                >
+                  {/* Linha */}
+                  <div
+                    className="px-4 py-2.5 grid grid-cols-[minmax(0,1fr)_auto] gap-3 md:grid-cols-[minmax(0,1.5fr)_minmax(0,0.9fr)_88px_128px_92px] md:gap-4 md:items-center cursor-pointer"
+                    style={{ background: isOpen ? "rgba(255,255,255,0.03)" : "transparent" }}
+                    onClick={() => setExpanded(isOpen ? null : report.id)}
+                  >
+                    {/* Caminhão + motorista */}
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        aria-hidden
+                        className="rounded-full flex-shrink-0"
+                        style={{ width: 8, height: 8, background: st.color }}
+                      />
+                      <div className="min-w-0">
+                        <p className="font-medium text-sm truncate" style={{ color: "var(--text-primary)" }}>
+                          {report.truckName || report.truckId}
+                        </p>
+                        <p className="text-xs truncate" style={{ color: "var(--text-muted)" }}>
+                          {report.driverName || report.driverEmail}
+                        </p>
+                        {/* No celular, data e status entram aqui embaixo */}
+                        <p className="text-xs mt-0.5 md:hidden" style={{ color: "var(--text-muted)" }}>
+                          {formatDate(report.submittedAt)} • {st.label}
+                          {attention.length > 0 ? ` • ${attention.length} issues` : ""}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Data */}
+                    <p className="hidden md:block text-sm truncate" style={{ color: "var(--text-secondary)" }}>
                       {formatDate(report.submittedAt)}
                     </p>
-                    {report.status === "resolved" && report.resolvedAt && (
-                      <p className="text-xs mt-0.5" style={{ color: "#3b82f6" }}>
-                        Fixed {formatDate(report.resolvedAt)}
-                      </p>
-                    )}
-                  </div>
 
-                  {/* Status column */}
-                  <div className="pl-[60px] md:pl-0">
-                    <span
-                      className="text-xs font-semibold px-3 py-1 rounded-full inline-block"
-                      style={{ background: st.bg, color: st.color }}
-                    >
-                      {report.status === "needs_review" ? `${st.label} (${attention.length})` : st.label}
-                    </span>
-                  </div>
+                    {/* Problemas em aberto */}
+                    <div className="hidden md:block">
+                      {attention.length > 0 ? (
+                        <span
+                          className="mono-font text-xs font-bold px-2 py-0.5 rounded-md"
+                          style={{ background: "rgba(239,68,68,0.12)", color: "#ef4444" }}
+                        >
+                          {attention.length}
+                        </span>
+                      ) : (
+                        <span className="text-xs" style={{ color: "var(--text-muted)" }}>—</span>
+                      )}
+                    </div>
 
-                  {/* Actions column */}
-                  <div className="flex items-center gap-2 pl-[60px] md:pl-0 md:justify-end">
-                    {report.status === "needs_review" && (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); handleMarkFixed(report.id); }}
-                        className="p-2 rounded-lg hover:bg-white/10 transition-colors"
-                        style={{ color: "#3b82f6" }}
-                        title="Mark as Fixed / Marcar como Arrumado"
+                    {/* Status */}
+                    <div className="hidden md:block">
+                      <span
+                        className="text-xs font-semibold px-2.5 py-1 rounded-full inline-block whitespace-nowrap"
+                        style={{ background: st.bg, color: st.color }}
                       >
-                        <Wrench size={18} />
+                        {st.label}
+                      </span>
+                    </div>
+
+                    {/* Ações */}
+                    <div className="flex items-center gap-0.5 justify-end">
+                      {report.status === "needs_review" && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleMarkFixed(report.id); }}
+                          className="p-1.5 rounded-lg hover:bg-white/10 transition-colors"
+                          style={{ color: "#3b82f6" }}
+                          title="Mark as Fixed / Marcar como Arrumado"
+                        >
+                          <Wrench size={16} />
+                        </button>
+                      )}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDelete(report.id); }}
+                        className="p-1.5 rounded-lg hover:bg-white/10 transition-colors"
+                        style={{ color: "var(--text-muted)" }}
+                        title="Delete / Deletar"
+                      >
+                        <Trash2 size={16} />
                       </button>
-                    )}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleDelete(report.id); }}
-                      className="p-2 rounded-lg hover:bg-white/10 transition-colors"
-                      style={{ color: "var(--text-muted)" }}
-                      title="Delete / Deletar"
-                    >
-                      <Trash2 size={18} />
-                    </button>
-                    {isOpen ? <ChevronUp size={18} style={{ color: "var(--text-muted)" }} /> : <ChevronDown size={18} style={{ color: "var(--text-muted)" }} />}
+                      {isOpen
+                        ? <ChevronUp size={16} style={{ color: "var(--text-muted)" }} />
+                        : <ChevronDown size={16} style={{ color: "var(--text-muted)" }} />}
+                    </div>
                   </div>
-                </div>
 
                 {/* Expanded details */}
                 {isOpen && (
@@ -588,6 +782,7 @@ export default function Checklists() {
                       <div className="mt-4 p-3 rounded-lg" style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.3)" }}>
                         <p className="text-xs font-semibold" style={{ color: "#3b82f6" }}>
                           ✓ MARKED AS FIXED on {formatDate(report.resolvedAt)}
+                          {report.resolvedBy ? ` by ${report.resolvedBy}` : ""}
                         </p>
                       </div>
                     )}
@@ -598,6 +793,31 @@ export default function Checklists() {
                       <InfoBox icon={<Truck size={14} />} label="Truck" value={report.truckName || report.truckId} />
                       <InfoBox icon={<Gauge size={14} />} label="Odometer" value={`${report.odometer} mi`} />
                       <InfoBox icon={<Fuel size={14} />} label="Fuel Level" value={`${report.fuelLevel}%`} />
+                    </div>
+
+                    <div className="mb-4 space-y-1">
+                      {report.certified && (
+                        <p className="text-xs flex items-center gap-1.5" style={{ color: "var(--accent-green)" }}>
+                          <CheckCircle2 size={13} />
+                          Inspection certified by {report.certifiedBy || report.driverName || report.driverEmail}
+                          {report.certifiedAt ? ` on ${formatDate(report.certifiedAt)}` : ""}
+                        </p>
+                      )}
+                      {report.acknowledgedAt && (
+                        <p className="text-xs flex items-center gap-1.5" style={{ color: "var(--accent-amber)" }}>
+                          <CheckCircle2 size={13} />
+                          Driver reviewed {report.acknowledgedIssues?.length || 0} open issue
+                          {(report.acknowledgedIssues?.length || 0) !== 1 ? "s" : ""} from the previous report
+                          {` on ${formatDate(report.acknowledgedAt)}`}
+                        </p>
+                      )}
+                      {report.repairCertifiedBy && (
+                        <p className="text-xs flex items-center gap-1.5" style={{ color: "#3b82f6" }}>
+                          <Wrench size={13} />
+                          Repairs certified by {report.repairCertifiedBy}
+                          {report.repairCertifiedAt ? ` on ${formatDate(report.repairCertifiedAt)}` : ""}
+                        </p>
+                      )}
                     </div>
 
                     {/* Issues */}
@@ -617,7 +837,16 @@ export default function Checklists() {
                             </p>
                           </div>
                           <div className="flex items-center gap-1.5 flex-shrink-0 mt-0.5">
-                            {report.status === "needs_review" && !report.issuesResolved && (
+                            {report.issuesWoNumber && (
+                              <span
+                                className="mono-font text-xs font-semibold px-1.5 py-0.5 rounded whitespace-nowrap flex items-center gap-1 flex-shrink-0 mt-0.5"
+                                style={{ background: "rgba(74,155,106,0.15)", color: "var(--accent-green)" }}
+                                title="Work order created / Ordem de serviço criada"
+                              >
+                                <Wrench size={11} /> {report.issuesWoNumber}
+                              </span>
+                            )}
+                            {report.status === "needs_review" && !report.issuesResolved && !report.issuesWoNumber && (
                               <button
                                 onClick={() => openWoDialog(report, undefined, true)}
                                 className="flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold flex-shrink-0 mt-0.5"
@@ -726,10 +955,11 @@ export default function Checklists() {
                                 )}
                                 {item.woCreated && (
                                   <span
-                                    className="text-xs font-semibold px-1.5 py-0.5 rounded"
+                                    className="mono-font text-xs font-semibold px-1.5 py-0.5 rounded whitespace-nowrap flex items-center gap-1"
                                     style={{ background: "rgba(74,155,106,0.15)", color: "var(--accent-green)" }}
+                                    title="Work order created for this item / Ordem de serviço criada para este item"
                                   >
-                                    WO ✓
+                                    <Wrench size={11} /> {item.woNumber || "WO ✓"}
                                   </span>
                                 )}
                                 {report.status === "needs_review" && state !== "ok" && (
@@ -775,9 +1005,20 @@ export default function Checklists() {
                     </div>
                   </div>
                 )}
-              </div>
-            );
-          })}
+                </div>
+              );
+            })}
+          </div>
+
+          {hasMore && (
+            <div className="flex justify-center pt-2">
+              <button onClick={loadMore} disabled={loading} className="btn-ghost text-sm">
+                {loading
+                  ? "Loading... / Carregando..."
+                  : `Load older checklists / Carregar mais antigos (+${PAGE_SIZE})`}
+              </button>
+            </div>
+          )}
         </div>
       )}
 

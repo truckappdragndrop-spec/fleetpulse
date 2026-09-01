@@ -7,10 +7,8 @@ import {
   deleteDoc,
   doc,
   query,
-  where,
   orderBy,
   Timestamp,
-  type QueryConstraint,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 
@@ -20,21 +18,28 @@ export interface BaseDoc {
   updatedAt?: Timestamp;
 }
 
-export function useCollection<T extends BaseDoc>(
-  collectionName: string,
-  constraints: QueryConstraint[] = []
-) {
+/**
+ * Escuta uma coleção do Firestore em tempo real, ordenada da mais recente
+ * para a mais antiga.
+ *
+ * Nota sobre uma armadilha que existia aqui: o hook aceitava uma lista de
+ * `constraints` (filtros) e usava `JSON.stringify(constraints)` como
+ * dependência do useEffect. Objetos de filtro do Firestore não têm
+ * representação em JSON — todos viram `{}` — então dois filtros diferentes
+ * geravam a mesma dependência e a consulta não era refeita ao trocar o filtro.
+ * Como nenhuma tela chegou a usar esse parâmetro, ele foi removido em vez de
+ * remendado. Se um dia for preciso filtrar no servidor, o caminho é escrever
+ * um hook específico para aquela consulta, com dependências que o React
+ * consiga comparar de verdade (textos, números).
+ */
+export function useCollection<T extends BaseDoc>(collectionName: string) {
   const [data, setData] = useState<(T & { id: string })[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setIsLoading(true);
-    const baseConstraints: QueryConstraint[] = [orderBy("createdAt", "desc")];
-    const q = query(
-      collection(db, collectionName),
-      ...(constraints.length > 0 ? constraints : baseConstraints)
-    );
+    const q = query(collection(db, collectionName), orderBy("createdAt", "desc"));
 
     const unsubscribe = onSnapshot(
       q,
@@ -55,7 +60,7 @@ export function useCollection<T extends BaseDoc>(
     );
 
     return unsubscribe;
-  }, [collectionName, JSON.stringify(constraints)]);
+  }, [collectionName]);
 
   const create = useCallback(
     async (item: Omit<T, "id" | "createdAt" | "updatedAt">) => {
@@ -89,12 +94,4 @@ export function useCollection<T extends BaseDoc>(
   );
 
   return { data, isLoading, error, create, update, remove };
-}
-
-export function whereFn(
-  field: string,
-  op: "==" | "!=" | "<" | "<=" | ">" | ">=" | "array-contains" | "in",
-  value: unknown
-) {
-  return where(field, op, value);
 }

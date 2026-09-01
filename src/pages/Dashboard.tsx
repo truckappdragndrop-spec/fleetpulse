@@ -10,8 +10,9 @@ import {
   ArrowLeft, ArrowRight, ChevronUp, Route, Milestone, MapPin,
 } from "lucide-react";
 import type { Timestamp } from "firebase/firestore";
+import { pmFleetAlerts, PM_COLORS } from "@/lib/preventive";
 
-interface TruckDoc { id: string; fleetId: string; brand: string; model: string; status: string; currentKm: string; imageBase64?: string; registrationExpiry?: string; insuranceExpiry?: string; inspectionExpiry?: string; lastOilChangeMiles?: string; oilChangeInterval?: string; createdAt: Timestamp; }
+interface TruckDoc { id: string; fleetId: string; brand: string; model: string; status: string; currentKm: string; imageUrl?: string; imageBase64?: string; registrationExpiry?: string; insuranceExpiry?: string; inspectionExpiry?: string; lastOilChangeMiles?: string; oilChangeInterval?: string; createdAt: Timestamp; }
 interface MaintDoc { 
   id: string; 
   truckId: string; 
@@ -40,8 +41,8 @@ interface FuelDoc {
   miles?: string;         // Miles driven since last refuel
   createdAt: Timestamp; 
 }
-interface PartDoc { id: string; name: string; supplier: string; category: string; quantity: number; minStock: number; cost: number; imageBase64?: string; }
-interface HistoryDoc { id: string; partId: string; partName: string; truck: string; quantity: number; totalCost: number; reason: string; date: string; createdAt: Timestamp; }
+interface PartDoc { id: string; name: string; supplier: string; category: string; quantity: number; minStock: number; cost: number; imageUrl?: string; imageBase64?: string; }
+interface HistoryDoc { id: string; partId: string; partName: string; truck: string; quantity: number; totalCost: number; reason: string; date: string; createdAt: Timestamp; source?: string; }
 
 function safeNum(value: any): number { 
   if (value === undefined || value === null || value === '') return 0; 
@@ -336,7 +337,12 @@ export default function Dashboard() {
     return sum + laborCost + totalPartsCost;
   }, 0);
 
-  const totalPartsHistoryCost = filteredHistory.reduce((sum, h) => sum + (Number(h.totalCost) || 0), 0);
+  // Peças usadas em ordem de serviço já estão dentro do custo da manutenção
+  // (campo partsCost). Contá-las aqui de novo inflaria o total da frota, então
+  // esta soma considera apenas as saídas manuais do Inventory.
+  const totalPartsHistoryCost = filteredHistory
+    .filter(h => h.source !== "maintenance")
+    .reduce((sum, h) => sum + (Number(h.totalCost) || 0), 0);
   const totalFleetCost = totalFuelCost + totalMaintCost + totalPartsHistoryCost;
 
   const activeTrucks = trucks.filter(t => t.status === "active").length;
@@ -365,35 +371,31 @@ export default function Dashboard() {
           list.push({ fleetId: t.fleetId, label: d.label, detail: "expires in " + daysLeft + " days (" + exp.toLocaleDateString("en-US") + ")", severity: "warning" });
         }
       });
-      const lastOil = Number(t.lastOilChangeMiles) || 0;
-      const interval = Number(t.oilChangeInterval) || 0;
-      const current = Number(t.currentKm) || 0;
-      if (lastOil > 0 && interval > 0) {
-        const remaining = lastOil + interval - current;
-        if (remaining <= 0) {
-          list.push({ fleetId: t.fleetId, label: "Oil Change", detail: "overdue by " + Math.abs(remaining).toLocaleString() + " mi", severity: "expired" });
-        } else if (remaining <= 1000) {
-          list.push({ fleetId: t.fleetId, label: "Oil Change", detail: remaining.toLocaleString() + " mi remaining", severity: "warning" });
-        }
-      }
+      // A troca de óleo saiu daqui: virou uma das regras de manutenção
+      // preventiva, que tem card próprio logo abaixo com todos os serviços.
     });
     const order = { expired: 0, warning: 1 };
     return list.sort((a, b) => order[a.severity] - order[b.severity] || a.fleetId.localeCompare(b.fleetId, undefined, { numeric: true }));
   }, [trucks]);
 
-  const oilStatus = useMemo(() => {
-    return trucks
-      .filter(t => t.status !== "sold" && Number(t.lastOilChangeMiles) > 0 && Number(t.oilChangeInterval) > 0)
-      .map(t => {
-        const lastOil = Number(t.lastOilChangeMiles) || 0;
-        const interval = Number(t.oilChangeInterval) || 0;
-        const current = Number(t.currentKm) || 0;
-        const remaining = lastOil + interval - current;
-        const pct = Math.max(0, Math.min(100, (remaining / interval) * 100));
-        return { truckId: t.id, fleetId: t.fleetId, brand: t.brand, model: t.model, remaining, pct, lastOil, interval };
-      })
-      .sort((a, b) => a.remaining - b.remaining);
-  }, [trucks]);
+  // ===== MANUTENÇÃO PREVENTIVA =====
+  const [pmShowAll, setPmShowAll] = useState(false);
+
+  // Todas as regras de todos os caminhões, do mais urgente para o menos.
+  const pmAll = useMemo(
+    () => pmFleetAlerts(trucks as any, maintenance as any, ["overdue", "soon", "unknown", "ok"]),
+    [trucks, maintenance]
+  );
+
+  // O que fica visível por padrão. Mostrar as oito regras de cada caminhão de
+  // uma vez vira uma parede de verde que ninguém lê — mas a troca de óleo é a
+  // que se olha todo dia, e some da tela justamente quando está em dia, que é
+  // quando se quer saber quantas milhas ainda faltam. Então ela aparece sempre,
+  // e o resto só quando pede atenção.
+  const pmVisible = pmShowAll
+    ? pmAll
+    : pmAll.filter((p) => p.severity === "overdue" || p.severity === "soon" || p.key === "oil");
+  const pmHidden = pmAll.length - pmVisible.length;
 
   // Miles is now ALWAYS from fuel records, regardless of period
   const displayMiles = periodMiles;
@@ -607,7 +609,7 @@ export default function Dashboard() {
             </div>
             <div>
               <h3 className="text-sm font-bold uppercase tracking-wider" style={{ color: "var(--text-primary)" }}>Attention Needed / Atencao</h3>
-              <p className="text-xs" style={{ color: "var(--text-muted)" }}>Documents & oil change / Documentos e troca de oleo</p>
+              <p className="text-xs" style={{ color: "var(--text-muted)" }}>Registration, insurance, DOT / Documentos do caminhao</p>
             </div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -626,33 +628,64 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Oil Change Status */}
-      {oilStatus.length > 0 && (
+      {/* Preventive Maintenance / Manutencao Preventiva */}
+      {pmVisible.length > 0 && (
         <div className="glass-card p-5">
           <div className="flex items-center gap-3 mb-4">
             <div className="flex items-center justify-center rounded-xl" style={{ width: 40, height: 40, background: "rgba(59,130,246,0.12)" }}>
               <Gauge size={20} style={{ color: "#3b82f6" }} />
             </div>
-            <div>
-              <h3 className="text-sm font-bold uppercase tracking-wider" style={{ color: "var(--text-primary)" }}>Oil Change / Troca de Oleo</h3>
-              <p className="text-xs" style={{ color: "var(--text-muted)" }}>Miles until next oil change / Milhas ate a proxima troca</p>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-bold uppercase tracking-wider" style={{ color: "var(--text-primary)" }}>Preventive Maintenance / Manutencao Preventiva</h3>
+              <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                Oil change always shown • {pmAll.filter(p => p.severity === "overdue").length} overdue • {pmAll.filter(p => p.severity === "soon").length} coming up / Troca de oleo sempre visivel • {pmAll.filter(p => p.severity === "overdue").length} vencidos • {pmAll.filter(p => p.severity === "soon").length} chegando
+              </p>
             </div>
+            {(pmHidden > 0 || pmShowAll) && (
+              <button
+                onClick={() => setPmShowAll(!pmShowAll)}
+                className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap"
+                style={{ background: "rgba(255,255,255,0.05)", border: "1px solid var(--border-divider)", color: "var(--text-secondary)" }}
+              >
+                {pmShowAll ? "Only what's due / So o que vence" : `All services (+${pmHidden}) / Ver tudo`}
+                {pmShowAll ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              </button>
+            )}
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {oilStatus.map(o => (
-              <div key={o.truckId} className="p-3 rounded-xl" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--border-divider)" }}>
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-sm font-medium" style={{ color: "var(--text-primary)" }}><span className="mono-font font-bold" style={{ color: "var(--accent-amber)" }}>#{o.fleetId}</span> {o.brand} {o.model}</span>
-                  <span className="text-sm font-bold mono-font" style={{ color: o.remaining <= 0 ? "#ef4444" : o.remaining <= 1000 ? "var(--accent-amber)" : "#22c55e" }}>
-                    {o.remaining <= 0 ? Math.abs(o.remaining).toLocaleString() + " mi overdue" : o.remaining.toLocaleString() + " mi left"}
-                  </span>
-                </div>
-                <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.05)" }}>
-                  <div className="h-full rounded-full transition-all duration-700" style={{ width: o.pct + "%", background: o.remaining <= 0 ? "#ef4444" : o.remaining <= 1000 ? "var(--accent-amber)" : "#22c55e" }} />
-                </div>
-                <p className="text-[11px] mt-1" style={{ color: "var(--text-muted)" }}>Last change: {o.lastOil.toLocaleString()} mi • Every {o.interval.toLocaleString()} mi</p>
-              </div>
-            ))}
+            {pmVisible.map((p) => {
+              const color = PM_COLORS[p.severity];
+              return (
+                <Link
+                  to={`/trucks/${p.truckId}`}
+                  key={p.truckId + p.key}
+                  className="p-3 rounded-xl block transition-transform hover:scale-[1.01]"
+                  style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--border-divider)", borderLeft: `3px solid ${color}` }}
+                >
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <span className="text-sm font-medium truncate" style={{ color: "var(--text-primary)" }}>
+                      <span className="mono-font font-bold" style={{ color: "var(--accent-amber)" }}>#{p.fleetId}</span> {p.label}
+                    </span>
+                    <span className="text-sm font-bold mono-font whitespace-nowrap" style={{ color }}>{p.detail}</span>
+                  </div>
+                  {p.severity === "unknown" ? (
+                    // Barra cheia num item sem registro passaria a impressão de
+                    // "está tudo bem", que é justamente o que não se sabe.
+                    <div className="w-full h-2 rounded-full" style={{ background: "repeating-linear-gradient(90deg, rgba(255,255,255,0.10) 0 6px, transparent 6px 12px)" }} />
+                  ) : (
+                    <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.05)" }}>
+                      <div className="h-full rounded-full transition-all duration-700" style={{ width: p.pct + "%", background: color }} />
+                    </div>
+                  )}
+                  <p className="text-[11px] mt-1" style={{ color: "var(--text-muted)" }}>
+                    {p.lastMiles ? `Ultimo: ${p.lastMiles.toLocaleString("en-US")} mi` : "Sem registro"}
+                    {p.lastDate && ` (${p.lastDate.toLocaleDateString("en-US")})`}
+                    {p.intervalMiles > 0 && ` • a cada ${p.intervalMiles.toLocaleString("en-US")} mi`}
+                    {p.intervalMonths > 0 && ` • a cada ${p.intervalMonths} meses`}
+                  </p>
+                </Link>
+              );
+            })}
           </div>
         </div>
       )}

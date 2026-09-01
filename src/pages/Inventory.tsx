@@ -1,6 +1,17 @@
 import { useState, useEffect, useRef } from "react";
 import { useCollection } from "@/hooks/useCollection";
-import { Plus, Search, Package, Wrench, Trash2, Edit3, History, Camera, X } from "lucide-react";
+import { Plus, Search, Package, Wrench, Trash2, Edit3, History, Camera, X, ArrowUpDown, ArrowUp, ArrowDown, Hash, MapPin, Loader2 } from "lucide-react";
+import { uploadImage, imageSrc } from "@/lib/uploadImage";
+import { useDialogs } from "@/components/Dialogs";
+import {
+  PART_CONDITIONS,
+  conditionInfo,
+  displayPartCode,
+  formatLocation,
+  locationSortKey,
+  nextPartCode,
+  partSearchTerms,
+} from "@/lib/parts";
 
 interface PartDoc {
   id: string;
@@ -11,7 +22,17 @@ interface PartDoc {
   minStock: number;
   cost: number;
   partNumber?: string;
+  /** Código interno sequencial, ex. "P-0042". Cadastros antigos não têm. */
+  partCode?: string;
+  /** new | used | rebuilt */
+  condition?: string;
+  /** Endereço no estoque: prateleira, nível e espaço. */
+  shelf?: string;
+  level?: string;
+  bin?: string;
   notes?: string;
+  imageUrl?: string;
+  /** Registros antigos: foto em base64 dentro do próprio documento. */
   imageBase64?: string;
   createdAt: string;
 }
@@ -36,41 +57,9 @@ interface TruckDoc {
   currentKm: string;
 }
 
-function compressImage(file: File, maxWidth: number = 400, maxSizeKB: number = 500): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        let width = img.width;
-        let height = img.height;
-        if (width > maxWidth) {
-          height = (height * maxWidth) / width;
-          width = maxWidth;
-        }
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        ctx?.drawImage(img, 0, 0, width, height);
-        let quality = 0.7;
-        let base64 = canvas.toDataURL("image/jpeg", quality);
-        while (base64.length > maxSizeKB * 1024 && quality > 0.1) {
-          quality -= 0.1;
-          base64 = canvas.toDataURL("image/jpeg", quality);
-        }
-        resolve(base64);
-      };
-      img.onerror = reject;
-      img.src = event.target?.result as string;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
 export default function Inventory() {
   const { data: parts, isLoading, create, update, remove } = useCollection<PartDoc>("parts");
+  const { confirm, notify } = useDialogs();
   const { data: history, create: createHistory } = useCollection<HistoryDoc>("partsHistory");
 
   const [search, setSearch] = useState("");
@@ -81,7 +70,8 @@ export default function Inventory() {
   const [editingPart, setEditingPart] = useState<PartDoc | null>(null);
 
   const [form, setForm] = useState({
-    name: "", supplier: "", category: "engine", quantity: 0, minStock: 5, cost: 0, partNumber: "", notes: "", imageBase64: ""
+    name: "", supplier: "", category: "engine", quantity: 0, minStock: 5, cost: 0, partNumber: "", notes: "", imageUrl: "",
+    condition: "new", shelf: "", level: "", bin: ""
   });
 
   const [useForm, setUseForm] = useState({
@@ -91,6 +81,34 @@ export default function Inventory() {
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // Só apaga o base64 antigo quando a foto foi de fato trocada nesta edição.
+  const [photoReplaced, setPhotoReplaced] = useState(false);
+
+  // Ordenação da tabela. "critical" é o padrão: zeradas primeiro, depois as
+  // que estão no mínimo — a lista já abre respondendo "o que preciso resolver".
+  const [shelfFilter, setShelfFilter] = useState("all");
+  const [numbering, setNumbering] = useState(false);
+
+  type PartSortField = "critical" | "name" | "supplier" | "quantity" | "cost" | "value" | "location";
+  const [sortField, setSortField] = useState<PartSortField>("critical");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+
+  const toggleSort = (field: PartSortField) => {
+    setSortField(prev => {
+      if (prev === field) {
+        setSortDir(d => (d === "asc" ? "desc" : "asc"));
+        return prev;
+      }
+      // Texto começa de A a Z; número começa do maior.
+      setSortDir(field === "name" || field === "supplier" ? "asc" : "desc");
+      return field;
+    });
+  };
+
+  const sortIcon = (field: PartSortField) => {
+    if (sortField !== field) return <ArrowUpDown size={12} className="opacity-40" />;
+    return sortDir === "desc" ? <ArrowDown size={12} /> : <ArrowUp size={12} />;
+  };
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const { data: trucks } = useCollection<TruckDoc>("trucks");
@@ -100,21 +118,91 @@ export default function Inventory() {
       setForm({
         name: editingPart.name, supplier: editingPart.supplier, category: editingPart.category,
         quantity: editingPart.quantity, minStock: editingPart.minStock, cost: editingPart.cost,
-        partNumber: editingPart.partNumber || "", notes: editingPart.notes || "", imageBase64: editingPart.imageBase64 || ""
+        partNumber: editingPart.partNumber || "", notes: editingPart.notes || "", imageUrl: editingPart.imageUrl || "",
+        condition: editingPart.condition || "new",
+        shelf: editingPart.shelf || "", level: editingPart.level || "", bin: editingPart.bin || ""
       });
-      setImagePreview(editingPart.imageBase64 || null);
+      setImagePreview(imageSrc(editingPart.imageUrl, editingPart.imageBase64) || null);
       setUploadError(null);
+      setPhotoReplaced(false);
     }
   }, [editingPart]);
 
-  const filteredParts = parts.filter(p => {
-    const match = p.name.toLowerCase().includes(search.toLowerCase()) || 
-                  p.supplier.toLowerCase().includes(search.toLowerCase());
-    if (filter === "in-stock") return match && p.quantity > p.minStock;
-    if (filter === "low") return match && p.quantity > 0 && p.quantity <= p.minStock;
-    if (filter === "out") return match && p.quantity === 0;
-    return match;
-  });
+  // Valor parado em cada peça — o número que responde "onde está meu dinheiro".
+  const partValue = (p: PartDoc) => Number(p.quantity || 0) * Number(p.cost || 0);
+
+  // 0 = zerada, 1 = no mínimo, 2 = ok. Usado na ordenação padrão.
+  const criticality = (p: PartDoc) =>
+    p.quantity === 0 ? 0 : p.quantity <= p.minStock ? 1 : 2;
+
+  const filteredParts = parts
+    .filter(p => {
+      const term = search.trim().toLowerCase();
+      // Procura por tudo: nome, fornecedor, P/N do fabricante, categoria,
+      // código interno, condição e endereço na prateleira.
+      const match = !term || partSearchTerms(p).includes(term);
+      if (shelfFilter !== "all" && (p.shelf || "").toUpperCase() !== shelfFilter) return false;
+      if (filter === "in-stock") return match && p.quantity > p.minStock;
+      if (filter === "low") return match && p.quantity > 0 && p.quantity <= p.minStock;
+      if (filter === "out") return match && p.quantity === 0;
+      return match;
+    })
+    .sort((a, b) => {
+      const dir = sortDir === "desc" ? -1 : 1;
+      switch (sortField) {
+        case "name":
+          return a.name.localeCompare(b.name, undefined, { numeric: true }) * dir;
+        case "supplier":
+          return (a.supplier || "").localeCompare(b.supplier || "") * dir;
+        case "quantity":
+          return (a.quantity - b.quantity) * dir;
+        case "cost":
+          return (Number(a.cost || 0) - Number(b.cost || 0)) * dir;
+        case "value":
+          return (partValue(a) - partValue(b)) * dir;
+        case "location":
+          return locationSortKey(a).localeCompare(locationSortKey(b)) * dir;
+        default:
+          // Críticas primeiro; dentro do mesmo grupo, ordem alfabética.
+          return (
+            (criticality(a) - criticality(b)) * dir ||
+            a.name.localeCompare(b.name, undefined, { numeric: true })
+          );
+      }
+    });
+
+  // Prateleiras que existem de verdade no cadastro, para o filtro.
+  const shelves = Array.from(
+    new Set(parts.map(p => (p.shelf || "").trim().toUpperCase()).filter(Boolean))
+  ).sort();
+
+  const unnumbered = parts.filter(p => !p.partCode);
+
+  /** Atribui código interno às peças cadastradas antes desta funcionalidade. */
+  const numberOldParts = async () => {
+    if (numbering || unnumbered.length === 0) return;
+    const ok = await confirm({
+      title: `Number ${unnumbered.length} older parts?`,
+      message: "Vai atribuir um código interno (P-0001, P-0002...) a cada peça já cadastrada, na ordem alfabética. Roda uma vez só.",
+      confirmLabel: "Number them",
+    });
+    if (!ok) return;
+
+    setNumbering(true);
+    try {
+      const inOrder = [...unnumbered].sort((a, b) => a.name.localeCompare(b.name));
+      for (const part of inOrder) {
+        const { number } = await nextPartCode();
+        await update(part.id, { partCode: number } as Partial<PartDoc>);
+      }
+      notify(`${inOrder.length} parts numbered / numeradas`, "success");
+    } catch (err) {
+      console.error("Error numbering parts:", err);
+      notify("Could not finish — run it again to continue", "error");
+    } finally {
+      setNumbering(false);
+    }
+  };
 
   const totalValue = parts.reduce((sum, p) => sum + p.quantity * p.cost, 0);
   const lowStock = parts.filter(p => p.quantity > 0 && p.quantity <= p.minStock).length;
@@ -133,12 +221,13 @@ export default function Inventory() {
     }
     setUploadingImage(true);
     try {
-      const base64 = await compressImage(file);
-      setImagePreview(base64);
-      setForm(prev => ({ ...prev, imageBase64: base64 }));
+      const url = await uploadImage(file, "parts");
+      setImagePreview(url);
+      setForm(prev => ({ ...prev, imageUrl: url }));
+      setPhotoReplaced(true);
       setUploadError(null);
     } catch (err) {
-      setUploadError("Failed to process image");
+      setUploadError("Failed to upload image");
       console.error(err);
     } finally {
       setUploadingImage(false);
@@ -148,30 +237,49 @@ export default function Inventory() {
   function clearImage() {
     setImagePreview(null);
     setUploadError(null);
-    setForm(prev => ({ ...prev, imageBase64: "" }));
+    setForm(prev => ({ ...prev, imageUrl: "" }));
+    setPhotoReplaced(true);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   async function savePart() {
     if (!form.name.trim() || !form.supplier.trim()) {
-      alert("Please fill in Part Name and Supplier");
+      notify("Please fill in Part Name and Supplier", "warning");
       return;
     }
-    const data = { ...form, createdAt: new Date().toISOString() };
+    const data = {
+      ...form,
+      createdAt: new Date().toISOString(),
+      // Troca de foto: descarta o base64 antigo, que só ocupava espaço no doc.
+      ...(photoReplaced ? { imageBase64: "" } : {}),
+    };
     if (editingPart) {
       await update(editingPart.id, data);
       setEditingPart(null);
     } else {
-      await create(data);
+      // Toda peça nova nasce com um código interno sequencial.
+      const { number: partCode, provisional } = await nextPartCode();
+      await create({ ...data, partCode } as typeof data & { partCode: string });
+      notify(
+        provisional
+          ? `${partCode} saved with a temporary code / código provisório`
+          : `${partCode} registered / cadastrada`,
+        provisional ? "warning" : "success"
+      );
     }
     setModalOpen(false);
     resetForm();
   }
 
   function resetForm() {
-    setForm({ name: "", supplier: "", category: "engine", quantity: 0, minStock: 5, cost: 0, partNumber: "", notes: "", imageBase64: "" });
+    setForm({
+      name: "", supplier: "", category: "engine", quantity: 0, minStock: 5, cost: 0,
+      partNumber: "", notes: "", imageUrl: "",
+      condition: "new", shelf: "", level: "", bin: "",
+    });
     setImagePreview(null);
     setUploadError(null);
+    setPhotoReplaced(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
@@ -179,7 +287,7 @@ export default function Inventory() {
     if (!useForm.truck || !useForm.partId || useForm.quantity < 1) return;
     const part = parts.find(p => p.id === useForm.partId);
     if (!part || useForm.quantity > part.quantity) {
-      alert("Not enough stock!");
+      notify("Not enough stock!", "warning");
       return;
     }
     await update(part.id, { quantity: part.quantity - useForm.quantity });
@@ -192,9 +300,15 @@ export default function Inventory() {
     setUseForm({ truck: "", partId: "", quantity: 1, reason: "", date: new Date().toISOString().split("T")[0], notes: "" });
   }
 
-  async function deletePart(id: string) {
-    if (!confirm("Delete this part?")) return;
-    await remove(id);
+  async function deletePart(part: PartDoc) {
+    const ok = await confirm({
+      title: "Delete this part?",
+      message: `${part.name} — ${part.supplier}. This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
+    await remove(part.id);
   }
 
   const getStatus = (p: PartDoc) => {
@@ -274,7 +388,7 @@ export default function Inventory() {
       <div className="flex flex-col sm:flex-row gap-3 mb-4">
         <div className="relative flex-1">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }} />
-          <input type="text" placeholder="Search parts..." value={search} onChange={e => setSearch(e.target.value)}
+          <input type="text" placeholder="Search code, name, P/N, supplier, shelf..." value={search} onChange={e => setSearch(e.target.value)}
             className="w-full pl-10 pr-4 py-2.5 rounded-lg input-dark" style={{ background: "var(--card-bg)", border: "1px solid var(--border-color)", color: "white" }} />
         </div>
         <select value={filter} onChange={e => setFilter(e.target.value)} className="px-4 py-2.5 rounded-lg input-dark" style={{ background: "var(--card-bg)", border: "1px solid var(--border-color)", color: "white" }}>
@@ -283,6 +397,26 @@ export default function Inventory() {
           <option value="low">Low Stock</option>
           <option value="out">Out of Stock</option>
         </select>
+
+        {shelves.length > 0 && (
+          <select value={shelfFilter} onChange={e => setShelfFilter(e.target.value)} className="px-4 py-2.5 rounded-lg input-dark" style={{ background: "var(--card-bg)", border: "1px solid var(--border-color)", color: "white" }}>
+            <option value="all">All shelves</option>
+            {shelves.map(sh => <option key={sh} value={sh}>Shelf {sh}</option>)}
+          </select>
+        )}
+
+        {unnumbered.length > 0 && (
+          <button
+            onClick={numberOldParts}
+            disabled={numbering}
+            className="px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 whitespace-nowrap"
+            style={{ background: "rgba(255,255,255,0.05)", border: "1px solid var(--border-color)", color: "var(--text-secondary)" }}
+            title="Assign internal codes to parts registered before"
+          >
+            {numbering ? <Loader2 size={15} className="animate-spin" /> : <Hash size={15} />}
+            {numbering ? "Numbering..." : `Number ${unnumbered.length} older`}
+          </button>
+        )}
       </div>
 
       <div className="card overflow-hidden">
@@ -291,11 +425,32 @@ export default function Inventory() {
             <thead>
               <tr style={{ borderBottom: "1px solid var(--border-color)" }}>
                 <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Photo</th>
-                <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Part</th>
-                <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Supplier</th>
-                <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Qty</th>
-                <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Cost</th>
-                <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Status</th>
+                {([
+                  { field: "name", label: "Part" },
+                  { field: "location", label: "Location" },
+                  { field: "supplier", label: "Supplier" },
+                  { field: "quantity", label: "Qty" },
+                  { field: "cost", label: "Cost" },
+                  { field: "value", label: "Value" },
+                ] as { field: PartSortField; label: string }[]).map(col => (
+                  <th
+                    key={col.field}
+                    onClick={() => toggleSort(col.field)}
+                    className="text-left px-4 py-3 text-xs font-medium uppercase select-none cursor-pointer whitespace-nowrap"
+                    style={{ color: sortField === col.field ? "var(--accent-amber)" : "var(--text-muted)" }}
+                    title="Click to sort / Clique para ordenar"
+                  >
+                    <span className="inline-flex items-center gap-1">{col.label} {sortIcon(col.field)}</span>
+                  </th>
+                ))}
+                <th
+                  onClick={() => toggleSort("critical")}
+                  className="text-left px-4 py-3 text-xs font-medium uppercase select-none cursor-pointer whitespace-nowrap"
+                  style={{ color: sortField === "critical" ? "var(--accent-amber)" : "var(--text-muted)" }}
+                  title="Click to put the critical ones first / Críticas primeiro"
+                >
+                  <span className="inline-flex items-center gap-1">Status {sortIcon("critical")}</span>
+                </th>
                 <th className="text-left px-4 py-3 text-xs font-medium uppercase" style={{ color: "var(--text-muted)" }}>Actions</th>
               </tr>
             </thead>
@@ -303,11 +458,25 @@ export default function Inventory() {
               {filteredParts.map(part => {
                 const status = getStatus(part);
                 return (
-                  <tr key={part.id} className="hover:bg-opacity-50" style={{ borderBottom: "1px solid var(--border-color)" }}>
+                  <tr
+                    key={part.id}
+                    className="hover:bg-opacity-50"
+                    style={{
+                      borderBottom: "1px solid var(--border-color)",
+                      // Faixa na borda esquerda: acha o que está acabando sem
+                      // precisar ler a coluna de status linha por linha.
+                      borderLeft: `3px solid ${part.quantity === 0
+                        ? "#ef4444"
+                        : part.quantity <= part.minStock
+                          ? "#eab308"
+                          : "transparent"}`,
+                      background: part.quantity === 0 ? "rgba(239,68,68,0.04)" : "transparent",
+                    }}
+                  >
                     <td className="px-4 py-3">
-                      {part.imageBase64 ? (
+                      {imageSrc(part.imageUrl, part.imageBase64) ? (
                         <img 
-                          src={part.imageBase64} 
+                          src={imageSrc(part.imageUrl, part.imageBase64)} 
                           alt={part.name} 
                           className="w-12 h-12 rounded-lg object-cover"
                           style={{ border: "1px solid rgba(255,255,255,0.1)" }}
@@ -319,8 +488,30 @@ export default function Inventory() {
                       )}
                     </td>
                     <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <span className="mono-font text-xs font-semibold" style={{ color: part.partCode ? "var(--accent-amber)" : "var(--text-muted)" }}>
+                          {displayPartCode(part)}
+                        </span>
+                        <span
+                          className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
+                          style={{ background: conditionInfo(part.condition).bg, color: conditionInfo(part.condition).color }}
+                          title={conditionInfo(part.condition).labelPt}
+                        >
+                          {conditionInfo(part.condition).label}
+                        </span>
+                      </div>
                       <div className="font-medium" style={{ color: "var(--text-primary)" }}>{part.name}</div>
-                      {part.partNumber && <div className="text-xs" style={{ color: "var(--text-muted)" }}>#{part.partNumber}</div>}
+                      {part.partNumber && <div className="text-xs" style={{ color: "var(--text-muted)" }}>P/N {part.partNumber}</div>}
+                    </td>
+                    <td className="px-4 py-3">
+                      {formatLocation(part) !== "—" ? (
+                        <span className="mono-font text-sm flex items-center gap-1.5" style={{ color: "var(--text-primary)" }}>
+                          <MapPin size={13} style={{ color: "var(--accent-amber)" }} />
+                          {formatLocation(part)}
+                        </span>
+                      ) : (
+                        <span className="text-xs" style={{ color: "var(--text-muted)" }}>—</span>
+                      )}
                     </td>
                     <td className="px-4 py-3" style={{ color: "var(--text-secondary)" }}>{part.supplier}</td>
                     <td className="px-4 py-3">
@@ -328,6 +519,9 @@ export default function Inventory() {
                       <span className="text-xs ml-1" style={{ color: "var(--text-muted)" }}>/ min {part.minStock}</span>
                     </td>
                     <td className="px-4 py-3" style={{ color: "#22c55e" }}>${part.cost.toFixed(2)}</td>
+                    <td className="px-4 py-3 mono-font text-sm" style={{ color: "var(--text-secondary)" }}>
+                      ${partValue(part).toFixed(2)}
+                    </td>
                     <td className="px-4 py-3">
                       <span className="px-2 py-1 rounded-full text-xs font-medium" style={{ color: status.color, background: status.bg, border: `1px solid ${status.color}30` }}>
                         {status.text}
@@ -338,7 +532,7 @@ export default function Inventory() {
                         <button onClick={() => { setEditingPart(part); setModalOpen(true); }} className="p-1.5 rounded-lg hover:bg-opacity-20" style={{ color: "var(--text-muted)" }}>
                           <Edit3 size={14} />
                         </button>
-                        <button onClick={() => deletePart(part.id)} className="p-1.5 rounded-lg hover:bg-red-500 hover:bg-opacity-20" style={{ color: "var(--text-muted)" }}>
+                        <button onClick={() => deletePart(part)} className="p-1.5 rounded-lg hover:bg-red-500 hover:bg-opacity-20" style={{ color: "var(--text-muted)" }}>
                           <Trash2 size={14} />
                         </button>
                       </div>
@@ -455,9 +649,53 @@ export default function Inventory() {
                   <input type="number" placeholder="0.00" value={form.cost} onChange={e => setForm({...form, cost: parseFloat(e.target.value) || 0})} style={inputStyle} />
                 </div>
                 <div>
-                  <label style={labelStyle}>Part Number (optional)</label>
+                  <label style={labelStyle}>Manufacturer P/N (optional)</label>
                   <input type="text" placeholder="e.g. ABC-123" value={form.partNumber} onChange={e => setForm({...form, partNumber: e.target.value})} style={inputStyle} />
                 </div>
+              </div>
+
+              <div>
+                <label style={labelStyle}>Condition / Condição</label>
+                <div className="flex gap-2">
+                  {PART_CONDITIONS.map(c => (
+                    <button
+                      key={c.value}
+                      type="button"
+                      onClick={() => setForm({ ...form, condition: c.value })}
+                      className="flex-1 py-2.5 rounded-lg text-sm font-medium transition-all"
+                      style={{
+                        background: form.condition === c.value ? c.bg : "rgba(255,255,255,0.04)",
+                        color: form.condition === c.value ? c.color : "var(--text-muted)",
+                        border: `1px solid ${form.condition === c.value ? c.color + "66" : "rgba(255,255,255,0.1)"}`,
+                      }}
+                    >
+                      {c.label}
+                      <span className="block text-xs font-normal opacity-70">{c.labelPt}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label style={labelStyle}>
+                  Storage location / Localização
+                  <span className="ml-2 font-normal" style={{ color: "var(--text-muted)" }}>
+                    — prateleira, nível e espaço
+                  </span>
+                </label>
+                <div className="grid grid-cols-3 gap-3">
+                  <input type="text" placeholder="Shelf — A" value={form.shelf}
+                    onChange={e => setForm({ ...form, shelf: e.target.value.toUpperCase() })} style={inputStyle} />
+                  <input type="text" placeholder="Level — 2" value={form.level}
+                    onChange={e => setForm({ ...form, level: e.target.value })} style={inputStyle} />
+                  <input type="text" placeholder="Bin — A1" value={form.bin}
+                    onChange={e => setForm({ ...form, bin: e.target.value.toUpperCase() })} style={inputStyle} />
+                </div>
+                <p className="text-xs mt-1.5" style={{ color: "var(--text-muted)" }}>
+                  Fica assim na lista: <span className="mono-font" style={{ color: "var(--accent-amber)" }}>
+                    {formatLocation(form)}
+                  </span>
+                </p>
               </div>
               <div>
                 <label style={labelStyle}>Notes</label>

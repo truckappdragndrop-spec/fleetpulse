@@ -1,24 +1,42 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, lazy, Suspense } from "react";
 import { Routes, Route, Navigate, Link, useLocation } from "react-router";
 import { doc, getDoc } from "firebase/firestore";
 import { useFirebaseAuth } from "@/hooks/useFirebaseAuth";
 import { db } from "@/lib/firebase";
 import { ClipboardCheck, Fuel as FuelNavIcon, Home } from "lucide-react";
-import Dashboard from "@/pages/Dashboard";
-import Trucks from "@/pages/Trucks";
-import TruckDetails from "@/pages/TruckDetails";
-import TruckStats from "@/pages/TruckStats";
-import Maintenance from "@/pages/Maintenance";
-import Fuel from "@/pages/Fuel";
-import Inventory from "@/pages/Inventory";
-import Reports from "@/pages/Reports";
-import Checklists from "@/pages/Checklists";
+import Sidebar from "@/components/Sidebar";
 import Login from "@/pages/Login";
 import NotFound from "@/pages/NotFound";
-import Sidebar from "@/components/Sidebar";
-import DriverHome from "@/pages/driver/DriverHome";
-import DriverChecklist from "@/pages/driver/DriverChecklist";
-import DriverFuel from "@/pages/driver/DriverFuel";
+
+// Cada página vira um arquivo .js separado, baixado só quando alguém abre
+// aquela tela. Antes, o primeiro acesso baixava as 12 páginas de uma vez —
+// incluindo Reports e Maintenance, que são as maiores do projeto.
+// O motorista, que abre o app no celular no meio da rua, era quem mais pagava
+// por isso: baixava o painel administrativo inteiro sem nunca poder usá-lo.
+const Dashboard = lazy(() => import("@/pages/Dashboard"));
+const Trucks = lazy(() => import("@/pages/Trucks"));
+const TruckDetails = lazy(() => import("@/pages/TruckDetails"));
+const TruckStats = lazy(() => import("@/pages/TruckStats"));
+const Maintenance = lazy(() => import("@/pages/Maintenance"));
+const Fuel = lazy(() => import("@/pages/Fuel"));
+const Inventory = lazy(() => import("@/pages/Inventory"));
+const Reports = lazy(() => import("@/pages/Reports"));
+const Checklists = lazy(() => import("@/pages/Checklists"));
+const DriverHome = lazy(() => import("@/pages/driver/DriverHome"));
+const DriverChecklist = lazy(() => import("@/pages/driver/DriverChecklist"));
+const DriverFuel = lazy(() => import("@/pages/driver/DriverFuel"));
+
+// Mostrado enquanto o arquivo da página está sendo baixado
+function PageLoader() {
+  return (
+    <div className="flex items-center justify-center py-24">
+      <div
+        className="w-8 h-8 border-2 rounded-full animate-spin"
+        style={{ borderColor: "var(--accent-amber)", borderTopColor: "transparent" }}
+      />
+    </div>
+  );
+}
 
 type UserRole = "admin" | "driver" | null;
 
@@ -125,12 +143,14 @@ function ProtectedLayout() {
   if (!isAdmin) {
     return (
       <div style={{ paddingBottom: "calc(76px + env(safe-area-inset-bottom))", minHeight: "100vh", background: "var(--bg-primary)" }}>
-        <Routes>
-          <Route path="/" element={<DriverHome />} />
-          <Route path="/checklist" element={<DriverChecklist />} />
-          <Route path="/fuel" element={<DriverFuel />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <Suspense fallback={<PageLoader />}>
+          <Routes>
+            <Route path="/" element={<DriverHome />} />
+            <Route path="/checklist" element={<DriverChecklist />} />
+            <Route path="/fuel" element={<DriverFuel />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
         <DriverNav />
       </div>
     );
@@ -144,18 +164,20 @@ function ProtectedLayout() {
           esquerda) e de espaço no topo no celular (onde o botão do menu flutua). */}
       <main className="p-4 pt-20 sm:p-6 sm:pt-20 lg:ml-64 lg:p-8 lg:pt-8">
         <div className="max-w-7xl mx-auto">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/trucks" element={<Trucks />} />
-            <Route path="/trucks/:id" element={<TruckDetails />} />
-            <Route path="/trucks/:id/stats" element={<TruckStats />} />
-            <Route path="/maintenance" element={<Maintenance />} />
-            <Route path="/fuel" element={<Fuel />} />
-            <Route path="/inventory" element={<Inventory />} />
-            <Route path="/reports" element={<Reports />} />
-            <Route path="/checklists" element={<Checklists />} />
-            <Route path="*" element={<NotFound />} />
-          </Routes>
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/trucks" element={<Trucks />} />
+              <Route path="/trucks/:id" element={<TruckDetails />} />
+              <Route path="/trucks/:id/stats" element={<TruckStats />} />
+              <Route path="/maintenance" element={<Maintenance />} />
+              <Route path="/fuel" element={<Fuel />} />
+              <Route path="/inventory" element={<Inventory />} />
+              <Route path="/reports" element={<Reports />} />
+              <Route path="/checklists" element={<Checklists />} />
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+          </Suspense>
         </div>
       </main>
     </div>
